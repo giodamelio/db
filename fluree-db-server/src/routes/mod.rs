@@ -11,6 +11,7 @@ mod export;
 pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+#[cfg(feature = "iceberg")]
 mod iceberg_ssrf;
 mod import;
 mod ledger;
