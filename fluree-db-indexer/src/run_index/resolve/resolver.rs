@@ -41,7 +41,10 @@ const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE
 /// the resolver like ordinary entries so they stay queryable post-index.
 fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
     entry.predicate_ns == FLUREE_DB
-        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
+        && (entry.predicate_name == db::IDENTITY
+            || entry.predicate_name == db::RECEIVED_AT
+            || entry.predicate_name == db::MESSAGE
+            || entry.predicate_name == db::AUTHOR)
 }
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
