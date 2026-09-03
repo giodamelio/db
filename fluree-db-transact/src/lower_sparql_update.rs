@@ -2205,6 +2205,25 @@ fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
         }
         _ => {}
     }
+    // Everything the arms above do not name — the temporals especially, but also
+    // gYear, the durations and rdf:JSON — goes to the canonical lexical parser
+    // rather than the string fallback below.
+    //
+    // Falling straight through was silent data loss, not a missing feature. The
+    // caller pairs this value with `DatatypeConstraint::Explicit(xsd:dateTime)`
+    // either way, so a string body was stored under a temporal datatype; since
+    // `xsd:dateTime` persists as epoch microseconds, the string had no number to
+    // encode and read back as `i64::MIN` once indexed. Nothing failed and nothing
+    // warned. `FlakeValue` can hold every one of these, so the only reason they
+    // were lost is that this match never asked.
+    //
+    // `coerce_string_value` answers `Ok(String)` for a datatype it does not know,
+    // which is exactly the fallback below, so unknown IRIs are unaffected. A
+    // lexical that fails to parse still lands on the fallback, keeping this
+    // function's leniency.
+    if let Ok(value) = fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri) {
+        return value;
+    }
     // Fall back to string
     FlakeValue::String(lexical.to_string())
 }
