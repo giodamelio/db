@@ -29,6 +29,19 @@ macro_rules! build_dataset_view_from_spec {
             let to_t = time_resolve::resolve_time_spec(&ledger, &range.to).await?;
 
             let view = GraphDb::from_ledger_state(&ledger);
+            // `from_ledger_state` yields the default graph. The range was
+            // derived from `spec.default_graphs[0]`, whose `graph` selector is
+            // parsed and kept but has no other reader on this branch — without
+            // this the selector is silently dropped and a history range over a
+            // named graph scans g_id 0, answering with no rows.
+            let view = match spec
+                .default_graphs
+                .first()
+                .and_then(|source| source.graph_selector.as_ref())
+            {
+                Some(selector) => crate::Fluree::apply_graph_selector(view, selector)?,
+                None => view,
+            };
             let view = ($history_transform)(view).await?;
             Ok(DataSetDb::single(view).with_history_range(from_t, to_t))
         } else {
