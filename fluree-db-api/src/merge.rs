@@ -531,9 +531,33 @@ impl crate::Fluree {
         // Stage resolved flakes onto target state. An empty flake set is valid
         // (e.g., TakeBranch drops all source flakes) — we still create the merge
         // commit to record the parent relationship and prevent future re-merges.
-        let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
+        // Routing for the staged flakes. The target's registry alone is not
+        // enough: a source branch may have registered named graphs the target
+        // has never seen, and its flakes carry those graph Sids. Staging them
+        // against a target-only map fails with "unknown graph Sid" — every
+        // non-fast-forward merge of a branch that created a named graph.
+        //
+        // The IRIs are in hand (`graph_delta`, collected from the source
+        // commits), and the merge commit registers them a few lines below, so
+        // allocate the same provisional ids `stage()` would and route through
+        // those. `provisional_ids` returns already-registered graphs unchanged,
+        // so shared graphs keep the target's numbering.
+        let mut reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
             ApiError::internal(format!("Failed to build reverse graph during merge: {e}"))
         })?;
+        let incoming_iris: Vec<String> = graph_delta.values().cloned().collect();
+        let provisional = target_state
+            .snapshot
+            .graph_registry
+            .provisional_ids(&incoming_iris);
+        for iri in &incoming_iris {
+            if let (Some(sid), Some(&g_id)) = (
+                target_state.snapshot.encode_iri(iri),
+                provisional.get(iri.as_str()),
+            ) {
+                reverse_graph.entry(sid).or_insert(g_id);
+            }
+        }
 
         let current_head_t = target_state.t();
 

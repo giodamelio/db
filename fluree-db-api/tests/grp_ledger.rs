@@ -13,6 +13,8 @@ mod it_ledger_info_named_graphs;
 mod it_ledger_lifecycle;
 #[path = "it_merge.rs"]
 mod it_merge;
+#[path = "it_merge_graph_delta_collision.rs"]
+mod it_merge_graph_delta_collision;
 #[path = "it_merge_preview.rs"]
 mod it_merge_preview;
 #[path = "it_read_your_writes.rs"]
