@@ -453,6 +453,39 @@ fn validate_staged_reasoning_modes(
     })
 }
 
+/// Re-key a transaction's `graph_delta` from transaction-local graph ids into
+/// the ledger's `GraphRegistry` numbering.
+///
+/// `Txn.graph_delta` numbers the graphs a transaction mentions from
+/// `FIRST_USER_GRAPH_ID` upward in parse order, and says so
+/// (`TripleTemplate::graph_id`: "not ledger-stable, must be translated"). Every
+/// read SHACL performs is in the other space: the staged overlay's per-flake
+/// graph ids come from `GraphRegistry::provisional_ids`, and the base index and
+/// novelty are partitioned by the registry's ids too. The two agree only when a
+/// transaction happens to name the ledger's first user graphs in the same order,
+/// which is why writing to a second named graph validated against the *first*
+/// one's contents — silently, since a focus node read out of the wrong partition
+/// looks untyped and no shape targets it.
+///
+/// Uses the same `provisional_ids` call `stage()` makes, over the same IRI set,
+/// so a graph this transaction creates gets the id its staged flakes were filed
+/// under.
+#[cfg(feature = "shacl")]
+fn ledger_space_graph_delta(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    graph_delta: &FxHashMap<u16, String>,
+) -> FxHashMap<u16, String> {
+    let iris: Vec<String> = graph_delta.values().cloned().collect();
+    let provisional = snapshot.graph_registry.provisional_ids(&iris);
+    iris.into_iter()
+        .filter_map(|iri| {
+            provisional
+                .get(iri.as_str())
+                .map(|&g_id| (g_id, iri.clone()))
+        })
+        .collect()
+}
+
 /// Resolve SHACL config across all graphs affected by a transaction.
 ///
 /// Starts from the ledger-wide baseline (`resolve_effective_config(config, None)`)
@@ -1454,6 +1487,10 @@ async fn stage_with_config_shacl(
         None
     };
 
+    // SHACL reads through the staged view and the per-graph index partitions,
+    // both keyed by the ledger's registry ids — so re-key the transaction's own
+    // numbering before handing it on. See `ledger_space_graph_delta`.
+    let graph_delta = ledger_space_graph_delta(&view.base().snapshot, &graph_delta);
     let graph_sids: HashMap<GraphId, Sid> = graph_delta
         .iter()
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))

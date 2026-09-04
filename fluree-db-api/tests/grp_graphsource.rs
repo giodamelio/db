@@ -35,5 +35,7 @@ mod it_ontology_inline;
 mod it_shapes_cross_ledger;
 #[path = "it_shapes_inline.rs"]
 mod it_shapes_inline;
+#[path = "it_shapes_named_focus_graph.rs"]
+mod it_shapes_named_focus_graph;
 #[path = "it_validate_report.rs"]
 mod it_validate_report;

@@ -3241,9 +3241,25 @@ pub async fn stage_with_shacl(
     // Rebuild graph_sids from the cloned graph_delta + returned ns_registry.
     // These IRIs were already resolved during stage(), so sid_for_iri will find
     // the prefix already registered — no new allocations.
+    //
+    // Keyed by the *ledger* graph ids, not `graph_delta`'s transaction-local
+    // ones: `validate_staged_nodes` turns these back into the `g_id` it queries
+    // the staged view and the base index with, and both are partitioned by the
+    // registry's numbering (`stage()` files staged flakes under
+    // `GraphRegistry::provisional_ids`). The two agree only when a transaction
+    // names the ledger's first user graphs in the same order.
+    let provisional = view
+        .base()
+        .snapshot
+        .graph_registry
+        .provisional_ids(&graph_delta.values().cloned().collect::<Vec<_>>());
     let graph_sids: HashMap<GraphId, Sid> = graph_delta
-        .iter()
-        .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
+        .values()
+        .filter_map(|iri| {
+            provisional
+                .get(iri.as_str())
+                .map(|&g_id| (g_id, ns_registry.sid_for_iri(iri)))
+        })
         .collect();
 
     // Create SHACL engine from cache, with the current (novelty-aware) RDFS
