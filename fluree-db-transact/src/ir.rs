@@ -18,7 +18,7 @@
 //!   not match patterns.
 
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{FlakeValue, Sid};
+use fluree_db_core::{FlakeValue, Sid, TxnGraphId};
 use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
 use fluree_db_query::{VarId, VarRegistry};
@@ -173,7 +173,11 @@ pub struct Txn {
     /// - `0`: default graph
     /// - `1`: txn-meta graph (`#txn-meta`)
     /// - `2+`: user-defined named graphs
-    pub graph_delta: FxHashMap<u16, String>,
+    ///
+    /// Keyed in this transaction's own numbering — see [`TxnGraphId`]. Reading
+    /// per-graph data with one of these ids reads the wrong graph; go through
+    /// `GraphRegistry::ledger_graph_delta` first.
+    pub graph_delta: FxHashMap<TxnGraphId, String>,
 
     /// Namespace allocations made during lowering that the staging path must
     /// merge into its own registry before flake generation.
@@ -351,8 +355,10 @@ impl Txn {
         });
         // Register the (possibly-new) destination graph so the commit envelope
         // persists its g_id; `apply_delta` skips already-registered IRIs.
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.graph_delta.insert(
+            TxnGraphId(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID),
+            to_iri,
+        );
         txn
     }
 
@@ -370,8 +376,10 @@ impl Txn {
             // non-SILENT SPARQL MOVE (roadmap O3).
             silent: false,
         });
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.graph_delta.insert(
+            TxnGraphId(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID),
+            to_iri,
+        );
         txn
     }
 
@@ -389,8 +397,10 @@ impl Txn {
             // non-SILENT SPARQL ADD (roadmap O3).
             silent: false,
         });
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.graph_delta.insert(
+            TxnGraphId(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID),
+            to_iri,
+        );
         txn
     }
 
@@ -520,8 +530,9 @@ pub struct TripleTemplate {
     /// IMPORTANT: this ID is scoped to the transaction envelope (see `Txn.graph_delta`).
     /// It is **not** ledger-stable and must be translated via:
     /// `txn_local_id -> graph IRI (Txn.graph_delta) -> ledger GraphId (GraphRegistry)`
-    /// before doing any per-graph index/range queries.
-    pub graph_id: Option<u16>,
+    /// before doing any per-graph index/range queries. [`TxnGraphId`] is what
+    /// makes the compiler hold you to that.
+    pub graph_id: Option<TxnGraphId>,
 }
 
 impl TripleTemplate {
@@ -554,7 +565,7 @@ impl TripleTemplate {
     /// - `0`: default graph
     /// - `1`: txn-meta graph (reserved for commit metadata)
     /// - `2+`: user-defined named graphs
-    pub fn with_graph_id(mut self, graph_id: u16) -> Self {
+    pub fn with_graph_id(mut self, graph_id: TxnGraphId) -> Self {
         self.graph_id = Some(graph_id);
         self
     }

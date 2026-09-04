@@ -7,7 +7,7 @@
 //! `flake.invert_at(0)` for revert), so the loop body — and especially the
 //! `or_insert` semantics for the namespace and graph deltas — is shared.
 
-use fluree_db_core::{Commit, Flake};
+use fluree_db_core::{Commit, Flake, TxnGraphId};
 use std::collections::HashMap;
 
 /// Flakes and metadata accumulated from a sequence of commits.
@@ -18,7 +18,7 @@ pub(crate) struct CollectedCommitData {
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
     /// Union of graph deltas; earlier commits win on key collisions.
-    pub(crate) graph_delta: HashMap<u16, String>,
+    pub(crate) graph_delta: HashMap<TxnGraphId, String>,
 }
 
 /// Fold `commits` into a [`CollectedCommitData`].

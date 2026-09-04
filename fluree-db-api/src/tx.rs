@@ -14,7 +14,7 @@ use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{
     range_with_overlay, ContentId, ContentKind, FlakeValue, GraphId, IndexType, RangeMatch,
-    RangeOptions, RangeTest, Sid,
+    RangeOptions, RangeTest, Sid, TxnGraphId,
 };
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
@@ -227,10 +227,13 @@ impl SequentialStager {
         for (g_id, iri) in self.sim_registry.iter_entries() {
             reverse_graph.insert(ns_registry.sid_for_iri(iri), g_id);
         }
-        let mut graph_delta: FxHashMap<u16, String> = FxHashMap::default();
+        // Keys are this writer's numbering — here the simulated registry's,
+        // which is the sequential assignment a real apply would make. As with
+        // every `graph_delta`, only the IRIs travel; see `TxnGraphId`.
+        let mut graph_delta: FxHashMap<TxnGraphId, String> = FxHashMap::default();
         for iri in &self.merged_graph_iris {
             if let Some(g_id) = self.sim_registry.graph_id_for_iri(iri) {
-                graph_delta.insert(g_id, iri.clone());
+                graph_delta.insert(TxnGraphId(g_id), iri.clone());
             }
         }
 
@@ -453,36 +456,21 @@ fn validate_staged_reasoning_modes(
     })
 }
 
-/// Re-key a transaction's `graph_delta` from transaction-local graph ids into
-/// the ledger's `GraphRegistry` numbering.
+/// Re-key a transaction's `graph_delta` into the ledger's numbering, for the
+/// post-stage passes that read per-graph data.
 ///
-/// `Txn.graph_delta` numbers the graphs a transaction mentions from
-/// `FIRST_USER_GRAPH_ID` upward in parse order, and says so
-/// (`TripleTemplate::graph_id`: "not ledger-stable, must be translated"). Every
-/// read SHACL performs is in the other space: the staged overlay's per-flake
-/// graph ids come from `GraphRegistry::provisional_ids`, and the base index and
-/// novelty are partitioned by the registry's ids too. The two agree only when a
-/// transaction happens to name the ledger's first user graphs in the same order,
-/// which is why writing to a second named graph validated against the *first*
-/// one's contents — silently, since a focus node read out of the wrong partition
-/// looks untyped and no shape targets it.
-///
-/// Uses the same `provisional_ids` call `stage()` makes, over the same IRI set,
-/// so a graph this transaction creates gets the id its staged flakes were filed
-/// under.
-#[cfg(feature = "shacl")]
+/// Thin wrapper over `GraphRegistry::ledger_graph_delta`, keeping the
+/// `FxHashMap` the staging path already carries. Every caller here is about to
+/// index the staged overlay or a per-graph index partition, both of which are
+/// keyed by the registry — see [`TxnGraphId`] for what goes wrong otherwise.
 fn ledger_space_graph_delta(
     snapshot: &fluree_db_core::LedgerSnapshot,
-    graph_delta: &FxHashMap<u16, String>,
-) -> FxHashMap<u16, String> {
-    let iris: Vec<String> = graph_delta.values().cloned().collect();
-    let provisional = snapshot.graph_registry.provisional_ids(&iris);
-    iris.into_iter()
-        .filter_map(|iri| {
-            provisional
-                .get(iri.as_str())
-                .map(|&g_id| (g_id, iri.clone()))
-        })
+    graph_delta: &FxHashMap<TxnGraphId, String>,
+) -> FxHashMap<GraphId, String> {
+    snapshot
+        .graph_registry
+        .ledger_graph_delta(graph_delta.values().map(String::as_str))
+        .into_iter()
         .collect()
 }
 
@@ -1569,11 +1557,19 @@ async fn stage_with_config_shacl(
 /// instance — the staging path always has it on `&self`.
 async fn enforce_unique_after_staging(
     view: &StagedLedger,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_delta: &FxHashMap<TxnGraphId, String>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     inline_unique_properties: Option<&[String]>,
     staged_ns: &NamespaceRegistry,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
+    // Cross into the ledger's numbering once, here, because everything below
+    // reads per-graph data: `affected_graph_ids` resolves each staged flake's
+    // graph, and `enforce_unique_constraints` scans that graph's POST index
+    // through the staged overlay. Both are keyed by the registry, so a
+    // transaction-local id scans a different graph than the one written to —
+    // missing the real duplicate, and occasionally inventing one from an
+    // unrelated subject in whichever graph the number happened to name.
+    let graph_delta = &ledger_space_graph_delta(view.db(), graph_delta);
     let config = load_transaction_config(view.base()).await;
 
     // Start with config-resolved per-graph SIDs (same/cross ledger).
@@ -2103,8 +2099,9 @@ pub struct StageResult {
     pub ns_registry: NamespaceRegistry,
     /// User-provided transaction metadata (extracted from envelope-form JSON-LD)
     pub txn_meta: Vec<TxnMetaEntry>,
-    /// Named graph IRI to g_id mappings introduced by this transaction
-    pub graph_delta: rustc_hash::FxHashMap<u16, String>,
+    /// Named graph IRI to g_id mappings introduced by this transaction, in the
+    /// transaction's own numbering (see [`TxnGraphId`]).
+    pub graph_delta: rustc_hash::FxHashMap<TxnGraphId, String>,
     /// Graph-sync target, when this was a sync transaction (see
     /// [`fluree_db_transact::Txn::sync_graph`]). A sync that stages zero
     /// flakes is a legitimate no-change outcome, so the commit paths skip
@@ -2122,12 +2119,17 @@ pub struct StageResult {
 fn convert_named_graphs_to_templates(
     named_graphs: &[NamedGraphBlock],
     ns_registry: &mut NamespaceRegistry,
-) -> Result<(Vec<TripleTemplate>, rustc_hash::FxHashMap<u16, String>)> {
+) -> Result<(
+    Vec<TripleTemplate>,
+    rustc_hash::FxHashMap<TxnGraphId, String>,
+)> {
     use fluree_db_transact::{RawObject, RawTerm};
 
     let mut templates = Vec::new();
-    let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
-    let mut iri_to_id: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+    let mut graph_delta: rustc_hash::FxHashMap<TxnGraphId, String> =
+        rustc_hash::FxHashMap::default();
+    let mut iri_to_id: std::collections::HashMap<String, TxnGraphId> =
+        std::collections::HashMap::new();
     let mut next_graph_id: u16 = 3; // 0=default, 1=txn-meta, 2=config
 
     // Helper to expand prefixed name to full IRI
@@ -2220,7 +2222,7 @@ fn convert_named_graphs_to_templates(
     for block in named_graphs {
         // Assign a graph_id to this graph IRI (or reuse existing)
         let g_id = *iri_to_id.entry(block.iri.clone()).or_insert_with(|| {
-            let id = next_graph_id;
+            let id = TxnGraphId(next_graph_id);
             graph_delta.insert(id, block.iri.clone());
             next_graph_id += 1;
             id
@@ -2640,7 +2642,7 @@ impl crate::Fluree {
         StagedLedger,
         NamespaceRegistry,
         Vec<TxnMetaEntry>,
-        FxHashMap<u16, String>,
+        FxHashMap<TxnGraphId, String>,
     )> {
         // Adopt any namespace allocations the lowering step already made
         // (e.g. `lower_sparql_update` allocates IRIs against a caller-owned

@@ -16,7 +16,7 @@
 pub mod codec;
 
 use crate::error::{Error, Result};
-use crate::{CommitId, ContentId, ContentStore, Flake};
+use crate::{CommitId, ContentId, ContentStore, Flake, TxnGraphId};
 use codec::format::CommitSignature;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -217,7 +217,14 @@ pub struct Commit {
     /// - `0`: default graph
     /// - `1`: txn-meta graph (`#txn-meta`)
     /// - `2+`: user-defined named graphs
-    pub graph_delta: HashMap<u16, String>,
+    ///
+    /// Keyed by the authoring transaction's private numbering, not the
+    /// ledger's — see [`TxnGraphId`](crate::TxnGraphId). The registry assigns
+    /// its own ids from the *IRIs* at apply time (`apply_envelope_deltas`
+    /// takes only the values), so two commits that each registered their first
+    /// named graph both carry key 3 for different IRIs. Read the values; the
+    /// keys are only meaningful against this commit's own flakes.
+    pub graph_delta: HashMap<TxnGraphId, String>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set in the genesis commit; absent in subsequent commits.
@@ -359,8 +366,9 @@ pub struct CommitEnvelope {
     /// [`load_commit_envelope_by_id`]) can detect that a particular named
     /// graph has ever been registered without paying for a full ops fetch.
     /// Used by `ApiFulltextConfigProvider` to short-circuit when the config
-    /// graph was never registered anywhere in the chain.
-    pub graph_delta: HashMap<u16, String>,
+    /// graph was never registered anywhere in the chain — which reads the
+    /// values, the only part that carries meaning across commits.
+    pub graph_delta: HashMap<TxnGraphId, String>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.

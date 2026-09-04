@@ -358,6 +358,30 @@ impl GraphRegistry {
         result
     }
 
+    /// Re-key a transaction's graph delta into this registry's numbering.
+    ///
+    /// A transaction numbers its graphs privately (see
+    /// [`TxnGraphId`](crate::TxnGraphId)); the staged overlay and every
+    /// per-graph index partition are keyed by the registry. Anything that
+    /// reads per-graph data for a transaction has to cross that boundary, and
+    /// this is the crossing — pass the delta's *IRIs* and get back a delta
+    /// keyed the way the rest of the system reads.
+    ///
+    /// Graphs the transaction is introducing resolve too: this delegates to
+    /// [`provisional_ids`](Self::provisional_ids), which allocates the same ids
+    /// `apply_delta` will, so a caller sees the id its staged flakes were filed
+    /// under rather than a miss.
+    pub fn ledger_graph_delta<'a, I>(&self, iris: I) -> HashMap<GraphId, String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let iris: Vec<String> = iris.into_iter().map(str::to_string).collect();
+        let provisional = self.provisional_ids(&iris);
+        iris.into_iter()
+            .filter_map(|iri| provisional.get(iri.as_str()).map(|&g_id| (g_id, iri)))
+            .collect()
+    }
+
     /// Forward lookup: IRI → GraphId.
     pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
         self.iri_to_id.get(iri).copied()

@@ -21,7 +21,7 @@ use fluree_db_core::range::RangeMatch;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid, TxnGraphId};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
@@ -667,8 +667,11 @@ pub async fn stage(
             .clone()
             .unwrap_or_else(generate_txn_id);
 
-        // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
-        let graph_sids: HashMap<GraphId, Sid> = txn
+        // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support.
+        // Stays in the transaction's numbering: its only consumers are
+        // `TripleTemplate::graph_id` lookups in the generator and the upsert
+        // retraction pass, both of which speak that space.
+        let graph_sids: HashMap<TxnGraphId, Sid> = txn
             .graph_delta
             .iter()
             .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
@@ -2870,7 +2873,7 @@ async fn generate_upsert_deletions(
     ledger: &LedgerState,
     txn: &Txn,
     new_t: i64,
-    graph_sids: &std::collections::HashMap<u16, Sid>,
+    graph_sids: &std::collections::HashMap<TxnGraphId, Sid>,
 ) -> Result<Vec<fluree_db_core::Flake>> {
     use fluree_db_binary_index::BinaryGraphView;
     use fluree_db_core::{Flake, IndexType};
@@ -2879,7 +2882,7 @@ async fn generate_upsert_deletions(
 
     // Group deduplicated predicates by (subject, graph_id) so subject existence
     // is resolved once per subject rather than once per (subject, predicate).
-    let mut subject_groups: HashMap<(Sid, Option<u16>), Vec<Sid>> = HashMap::new();
+    let mut subject_groups: HashMap<(Sid, Option<TxnGraphId>), Vec<Sid>> = HashMap::new();
     for template in &txn.insert_templates {
         if let (TemplateTerm::Sid(s), TemplateTerm::Sid(p)) =
             (&template.subject, &template.predicate)
@@ -2917,7 +2920,7 @@ async fn generate_upsert_deletions(
     // txn_local_g_id -> graph IRI (txn.graph_delta) -> ledger g_id (GraphRegistry)
     // None in the value position means the graph is not yet in the ledger
     // registry (new graph in this txn), so there cannot be existing values.
-    let ledger_g_for_txn_g: HashMap<Option<u16>, Option<u16>> = subject_groups
+    let ledger_g_for_txn_g: HashMap<Option<TxnGraphId>, Option<GraphId>> = subject_groups
         .keys()
         .map(|(_, txn_g)| *txn_g)
         .collect::<HashSet<_>>()

@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
+use fluree_db_core::TxnGraphId;
 use fluree_db_query::parse::{
     LiteralValue, UnresolvedDatatypeConstraint, UnresolvedPattern, UnresolvedTerm,
     UnresolvedTriplePattern,
@@ -699,8 +700,8 @@ struct BlankNodeVarNamer {
 
 struct TemplateGraphIds {
     next: u16,
-    iri_to_local: std::collections::HashMap<String, u16>,
-    delta: FxHashMap<u16, String>,
+    iri_to_local: std::collections::HashMap<String, TxnGraphId>,
+    delta: FxHashMap<TxnGraphId, String>,
 }
 
 impl TemplateGraphIds {
@@ -713,11 +714,11 @@ impl TemplateGraphIds {
         }
     }
 
-    fn get_or_assign(&mut self, iri: String) -> u16 {
+    fn get_or_assign(&mut self, iri: String) -> TxnGraphId {
         if let Some(id) = self.iri_to_local.get(&iri) {
             return *id;
         }
-        let id = self.next;
+        let id = TxnGraphId(self.next);
         self.next = self
             .next
             .checked_add(1)
@@ -727,7 +728,7 @@ impl TemplateGraphIds {
         id
     }
 
-    fn delta(&self) -> FxHashMap<u16, String> {
+    fn delta(&self) -> FxHashMap<TxnGraphId, String> {
         self.delta.clone()
     }
 }
@@ -900,8 +901,10 @@ pub fn lower_sparql_update(
             // non-enumerable until a flake lands in it.
             let iri = expand_iri(&create.graph, prologue)?;
             let mut txn = Txn::update().with_opts(opts);
-            txn.graph_delta
-                .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, iri);
+            txn.graph_delta.insert(
+                TxnGraphId(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID),
+                iri,
+            );
             txn
         }
         UpdateOperation::Add(t) => lower_transfer(t, prologue, TransferMode::Add, opts)?,
@@ -1010,7 +1013,7 @@ fn lower_transfer(
     // deterministically from the IRI.
     if let GraphSel::Graph(iri) = &to {
         txn.graph_delta.insert(
-            fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
+            TxnGraphId(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID),
             iri.clone(),
         );
     }
@@ -1467,7 +1470,7 @@ fn lower_modify(
         Vec::new()
     };
 
-    let default_template_graph_id: Option<u16> = with_graph_iri
+    let default_template_graph_id: Option<TxnGraphId> = with_graph_iri
         .as_ref()
         .map(|iri| graph_ids.get_or_assign(iri.clone()));
 
@@ -1558,7 +1561,7 @@ fn lower_quad_pattern_to_templates(
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeCounter,
     graph_ids: &mut TemplateGraphIds,
-    default_graph_id: Option<u16>,
+    default_graph_id: Option<TxnGraphId>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
     for el in elements {

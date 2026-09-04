@@ -66,11 +66,62 @@ impl fmt::Display for RuntimePredicateId {
 // GraphId
 // ---------------------------------------------------------------------------
 
-/// Graph dictionary ID (u16).
+/// Graph dictionary ID (u16), in the **ledger's** numbering.
 ///
-/// 0 = default graph, 1 = txn-meta. Named-graph dict indices start at 2.
+/// 0 = default graph, 1 = txn-meta, 2 = config, 3+ = user graphs. Assigned by
+/// `GraphRegistry` and stable for the life of the ledger. Every per-graph index
+/// partition, the novelty overlay, and `GraphDbRef` are keyed by these.
+///
+/// Not to be confused with [`TxnGraphId`], which is a *transaction's* private
+/// numbering of the same graphs.
+///
 /// Using a type alias keeps a single definition for easy future changes.
 pub type GraphId = u16;
+
+// ---------------------------------------------------------------------------
+// TxnGraphId
+// ---------------------------------------------------------------------------
+
+/// A graph id in a **transaction's own** numbering (u16).
+///
+/// A transaction numbers the graphs it mentions from `FIRST_USER_GRAPH_ID`
+/// upward in parse order, fresh each time, and carries the mapping alongside
+/// as `Txn.graph_delta` / `Commit.graph_delta`. The number is meaningless
+/// without that map: the same id names a different graph in the next
+/// transaction, and usually a different graph from the one the ledger's
+/// `GraphRegistry` filed it under. They coincide only when a transaction
+/// happens to name the ledger's first user graphs in the same order.
+///
+/// Deliberately *not* [`GraphId`]. Staged flakes, every per-graph index
+/// partition, and novelty are keyed by the registry's numbering, so reading
+/// with a transaction's number returns another graph's data — silently, and
+/// with no way to tell from the value that it came from the wrong graph. That
+/// mistake has been made in three separate places; the type exists so the
+/// compiler catches the fourth.
+///
+/// Convert with `GraphRegistry::ledger_graph_delta`, which allocates the same
+/// provisional ids `stage()` files staged flakes under, so a graph the
+/// transaction is introducing resolves too.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[repr(transparent)]
+pub struct TxnGraphId(pub u16);
+
+impl TxnGraphId {
+    #[inline]
+    pub fn as_u16(self) -> u16 {
+        self.0
+    }
+    #[inline]
+    pub fn from_u16(v: u16) -> Self {
+        Self(v)
+    }
+}
+
+impl fmt::Display for TxnGraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TxnGraphId({})", self.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TxnT

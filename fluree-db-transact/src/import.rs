@@ -26,7 +26,7 @@ mod inner {
     use fluree_db_core::CommitId;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
-        TxnMetaEntry,
+        TxnGraphId, TxnMetaEntry,
     };
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
@@ -685,7 +685,16 @@ mod inner {
 
             txn_signature: None,
             txn_meta,
-            graph_delta,
+            // `Commit::graph_delta` keys are the *writer's* numbering, and
+            // import's is the shared graph allocator's — deliberately the same
+            // ids the index will use, so `graph_delta` and `graphs.dict` agree.
+            // That makes them ledger-stable here, unlike the transaction path,
+            // but the field's contract is unchanged either way: read the IRIs,
+            // the keys are only meaningful against this commit.
+            graph_delta: graph_delta
+                .into_iter()
+                .map(|(g_id, iri)| (TxnGraphId(g_id), iri))
+                .collect(),
             ns_split_mode,
         };
 

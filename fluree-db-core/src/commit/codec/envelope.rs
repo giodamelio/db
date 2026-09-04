@@ -16,7 +16,7 @@ use super::varint::{
 };
 use crate::ns_encoding::NsSplitMode;
 use crate::ContentId;
-use crate::{CommitId, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
+use crate::{CommitId, TxnGraphId, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
 use std::collections::HashMap;
 
 // --- Presence flag bits ---
@@ -67,8 +67,9 @@ pub struct CodecEnvelope {
     pub txn_signature: Option<TxnSignature>,
     /// User-provided transaction metadata (replay-safe)
     pub txn_meta: Vec<TxnMetaEntry>,
-    /// Named graph IRI to g_id mappings introduced by this commit.
-    pub graph_delta: HashMap<u16, String>,
+    /// Named graph IRI to g_id mappings introduced by this commit, keyed by
+    /// the authoring transaction's numbering (see `Commit::graph_delta`).
+    pub graph_delta: HashMap<TxnGraphId, String>,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<NsSplitMode>,
@@ -457,15 +458,19 @@ fn decode_ns_delta(data: &[u8], pos: &mut usize) -> Result<HashMap<u16, String>,
 }
 
 // =============================================================================
-// graph_delta (HashMap<u16, String>)
+// graph_delta (HashMap<TxnGraphId, String>)
 // =============================================================================
+//
+// The wire is unchanged: `TxnGraphId` is `#[repr(transparent)]` over the u16
+// that was always written here, so an envelope encoded before the newtype
+// decodes identically after it.
 
-fn encode_graph_delta(delta: &HashMap<u16, String>, buf: &mut Vec<u8>) {
+fn encode_graph_delta(delta: &HashMap<TxnGraphId, String>, buf: &mut Vec<u8>) {
     encode_varint(delta.len() as u64, buf);
     let mut entries: Vec<_> = delta.iter().collect();
     entries.sort_by_key(|(g_id, _)| **g_id);
     for (g_id, iri) in entries {
-        encode_varint(*g_id as u64, buf);
+        encode_varint(u64::from(g_id.as_u16()), buf);
         encode_len_str(iri, buf);
     }
 }
@@ -473,14 +478,14 @@ fn encode_graph_delta(delta: &HashMap<u16, String>, buf: &mut Vec<u8>) {
 fn decode_graph_delta(
     data: &[u8],
     pos: &mut usize,
-) -> Result<HashMap<u16, String>, CommitCodecError> {
+) -> Result<HashMap<TxnGraphId, String>, CommitCodecError> {
     let count = decode_varint(data, pos)? as usize;
     let mut map = HashMap::with_capacity(count);
     for _ in 0..count {
         let raw = decode_varint(data, pos)?;
         let g_id = u16::try_from(raw).map_err(|_| CommitCodecError::GIdOutOfRange(raw))?;
         let iri = decode_len_str(data, pos)?;
-        map.insert(g_id, iri);
+        map.insert(TxnGraphId(g_id), iri);
     }
     Ok(map)
 }
@@ -715,8 +720,11 @@ mod tests {
     fn test_round_trip_graph_delta() {
         let mut commit = make_minimal_commit();
         commit.graph_delta = HashMap::from([
-            (2, "http://example.org/graph/products".into()),
-            (3, "http://example.org/graph/orders".into()),
+            (
+                TxnGraphId(2),
+                "http://example.org/graph/products".to_string(),
+            ),
+            (TxnGraphId(3), "http://example.org/graph/orders".to_string()),
         ]);
 
         let mut buf = Vec::new();
@@ -725,7 +733,7 @@ mod tests {
         let d = decode_envelope(&buf).unwrap();
         assert_eq!(d.graph_delta.len(), 2);
         assert_eq!(
-            d.graph_delta.get(&2),
+            d.graph_delta.get(&TxnGraphId(2)),
             Some(&"http://example.org/graph/products".to_string())
         );
     }

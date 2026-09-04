@@ -17,6 +17,7 @@ use crate::ir::{InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnTyp
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
+use fluree_db_core::TxnGraphId;
 use fluree_db_query::parse::{
     parse_where_with_counters, JsonLdParseCtx, JsonLdParsePolicy, PathAliasMap, UnresolvedQuery,
 };
@@ -36,7 +37,7 @@ use std::sync::Arc;
 /// They do not need to be globally stable across commits, as long as the commit
 /// carries the mapping used to encode flakes.
 struct GraphIdAssigner {
-    iri_to_id: HashMap<String, u16>,
+    iri_to_id: HashMap<String, TxnGraphId>,
     next_id: u16, // 2+ reserved for user graphs
 }
 
@@ -48,17 +49,17 @@ impl GraphIdAssigner {
         }
     }
 
-    fn get_or_assign(&mut self, iri: &str) -> u16 {
+    fn get_or_assign(&mut self, iri: &str) -> TxnGraphId {
         if let Some(&id) = self.iri_to_id.get(iri) {
             return id;
         }
-        let id = self.next_id;
+        let id = TxnGraphId(self.next_id);
         self.next_id += 1;
         self.iri_to_id.insert(iri.to_string(), id);
         id
     }
 
-    fn delta(&self) -> rustc_hash::FxHashMap<u16, String> {
+    fn delta(&self) -> rustc_hash::FxHashMap<TxnGraphId, String> {
         self.iri_to_id
             .iter()
             .map(|(iri, &g_id)| (g_id, iri.clone()))
@@ -180,7 +181,7 @@ pub fn parse_transaction(
 /// Transaction-local graph id assigned to the sync target graph. The
 /// payload may not address named graphs itself (rejected below), so the
 /// assigner never hands this id to anything else.
-const SYNC_GRAPH_LOCAL_ID: u16 = 2;
+const SYNC_GRAPH_LOCAL_ID: TxnGraphId = TxnGraphId(2);
 
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
 ///
@@ -546,7 +547,7 @@ fn parse_update_template_default_graph(
     from_named_aliases: &HashMap<String, String>,
     graph_ids: &mut GraphIdAssigner,
     strict: bool,
-) -> Result<Option<(u16, String)>> {
+) -> Result<Option<(TxnGraphId, String)>> {
     let Some(v) = graph_val else {
         return Ok(None);
     };
@@ -759,7 +760,7 @@ fn parse_update_default_graph(
     context: &ParsedContext,
     graph_ids: &mut GraphIdAssigner,
     strict: bool,
-) -> Result<Option<(u16, String)>> {
+) -> Result<Option<(TxnGraphId, String)>> {
     let Some(v) = graph_val else {
         return Ok(None);
     };
@@ -823,7 +824,7 @@ struct TemplateParseCtx<'a> {
     object_var_parsing: bool,
     strict_compact_iri: bool,
     graph_ids: &'a mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    default_graph_id: Option<TxnGraphId>,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
 }
@@ -837,7 +838,7 @@ impl<'a> TemplateParseCtx<'a> {
         object_var_parsing: bool,
         strict_compact_iri: bool,
         graph_ids: &'a mut GraphIdAssigner,
-        default_graph_id: Option<u16>,
+        default_graph_id: Option<TxnGraphId>,
         from_named_aliases: &'a HashMap<String, String>,
     ) -> Self {
         Self {
@@ -1342,7 +1343,7 @@ fn parse_expanded_object_with_ctx(
             }),
             _ => None,
         })
-        .map(|raw| -> Result<u16> {
+        .map(|raw| -> Result<TxnGraphId> {
             let resolved = resolve_graph_selector_str_for_templates(raw, ctx)?;
             Ok(ctx.graph_ids.get_or_assign(&resolved))
         })
@@ -1692,7 +1693,7 @@ fn parse_expanded_value(
     templates: &mut Vec<TripleTemplate>,
     object_var_parsing: bool,
     graph_ids: &mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    default_graph_id: Option<TxnGraphId>,
     from_named_aliases: &HashMap<String, String>,
     blank_counter: &mut usize,
 ) -> Result<ParsedValue> {
@@ -1955,7 +1956,7 @@ fn parse_list_values(
     object_var_parsing: bool,
     templates: &mut Vec<TripleTemplate>,
     graph_ids: &mut GraphIdAssigner,
-    default_graph_id: Option<u16>,
+    default_graph_id: Option<TxnGraphId>,
     from_named_aliases: &HashMap<String, String>,
     blank_counter: &mut usize,
 ) -> Result<Vec<ParsedValue>> {

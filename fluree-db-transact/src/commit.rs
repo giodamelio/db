@@ -24,7 +24,9 @@ use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentId, ContentKind, ContentStore, DictNovelty, Flake, TxnGraphId, TXN_META_GRAPH_ID,
+};
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{
@@ -150,8 +152,10 @@ pub struct CommitOpts {
     /// Named graph IRI to g_id mappings introduced by this transaction.
     ///
     /// Stored in the commit envelope for replay-safe persistence. The indexer
-    /// uses this to resolve graph IRIs to dictionary IDs when building the index.
-    pub graph_delta: std::collections::HashMap<u16, String>,
+    /// uses this to resolve graph IRIs to dictionary IDs when building the index
+    /// — from the IRIs, not these keys, which are the authoring transaction's
+    /// private numbering (see [`TxnGraphId`](fluree_db_core::TxnGraphId)).
+    pub graph_delta: std::collections::HashMap<TxnGraphId, String>,
     /// Namespace code delta to carry forward from original commits during rebase.
     ///
     /// When set, this overrides the `NamespaceRegistry::take_delta()` result,
@@ -296,7 +300,10 @@ impl CommitOpts {
     }
 
     /// Set the named graph delta (g_id -> IRI mappings)
-    pub fn with_graph_delta(mut self, graph_delta: std::collections::HashMap<u16, String>) -> Self {
+    pub fn with_graph_delta(
+        mut self,
+        graph_delta: std::collections::HashMap<TxnGraphId, String>,
+    ) -> Self {
         self.graph_delta = graph_delta;
         self
     }

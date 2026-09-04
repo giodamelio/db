@@ -1634,9 +1634,10 @@ mod tests {
             .with_id(make_test_commit_id("commit:1"))
             .with_namespace_delta(ns_delta);
         // Also add a graph_delta to test graph routing
-        commit
-            .graph_delta
-            .insert(3, "http://example.org/graph/test".to_string());
+        commit.graph_delta.insert(
+            fluree_db_core::TxnGraphId(3),
+            "http://example.org/graph/test".to_string(),
+        );
 
         state.apply_single_commit(commit, "test:main").unwrap();
 

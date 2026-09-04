@@ -43,6 +43,8 @@ mod it_transact_upsert_indexed;
 mod it_turtle_empty_collection;
 #[path = "it_txn_meta.rs"]
 mod it_txn_meta;
+#[path = "it_unique_second_named_graph.rs"]
+mod it_unique_second_named_graph;
 #[path = "it_update_wildcard_delete_indexed.rs"]
 mod it_update_wildcard_delete_indexed;
 #[path = "it_upsert_duplicate_ids_repro.rs"]
