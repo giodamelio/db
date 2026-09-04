@@ -16,8 +16,8 @@ use crate::constraints::value::{
 use crate::constraints::{Constraint, ConstraintViolation, NestedShape, NodeConstraint};
 use crate::error::Result;
 use fluree_db_core::{
-    FlakeValue, GraphDbRef, GraphId, IndexType, LedgerSnapshot, NoOverlay, RangeMatch, RangeTest,
-    SchemaHierarchy, Sid,
+    FlakeValue, GraphDbRef, GraphId, IndexType, LedgerSnapshot, NoOverlay, RangeMatch,
+    RangeOptions, RangeTest, SchemaHierarchy, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::rdf_names;
@@ -2451,9 +2451,17 @@ async fn check_value_against_nested_shape<'a>(
 
     // For IRI/blank-node values, evaluate the nested shape against the value as a focus node
     if let FlakeValue::Ref(sid) = value {
-        let nested_results =
-            validate_nested_shape(db, sid, nested, parent_shape, all_shapes, class_ctx, active)
-                .await?;
+        let value_db = resolve_value_node_graph(db, sid, class_ctx).await?;
+        let nested_results = validate_nested_shape(
+            value_db,
+            sid,
+            nested,
+            parent_shape,
+            all_shapes,
+            class_ctx,
+            active,
+        )
+        .await?;
         let has_violations = nested_results
             .iter()
             .any(|r| r.severity == Severity::Violation);
@@ -2961,6 +2969,73 @@ async fn value_conforms_cross_ledger(
     }
 
     Ok(false)
+}
+
+/// Choose the graph a referenced value node is *described* in.
+///
+/// A value reached through a property is a reference, and `f:shapesSource`
+/// makes the graph it resolves in ambiguous: the documented "shared value-set"
+/// layout puts a controlled vocabulary alongside the shapes and the records
+/// that cite it in another graph (`cookbook-shacl.md`, "Shared value-sets with
+/// `sh:class`"). `sh:class` already crosses that boundary — see
+/// [`value_conforms_to_class`], which unions the vocabulary graphs into the
+/// value's `rdf:type` lookup. A nested shape reached through `sh:node` /
+/// `sh:and` / `sh:or` / `sh:not` / `sh:xone` reads the value node's own
+/// triples instead, and without this it reads them from the focus node's graph
+/// only, where a vocabulary held with the shapes is invisible: every reference
+/// to it fails as though the term were undefined.
+///
+/// **Resolution, not union.** The focus graph wins whenever it describes the
+/// node at all, so a value the data graph defines is never re-read out of the
+/// shapes graph, and a node split across both is not silently stitched
+/// together. Only a node the focus graph says nothing about falls through to
+/// the vocabulary graphs, in `f:shapesSource` order. A node no graph describes
+/// stays on the focus graph, so its violation names the graph that was written
+/// to and an undeclared value is still refused.
+///
+/// Costs one point probe per referenced value, and only when `f:shapesSource`
+/// names a graph other than the focus node's — the single-graph default
+/// returns immediately.
+async fn resolve_value_node_graph<'a>(
+    db: GraphDbRef<'a>,
+    value: &Sid,
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+) -> Result<GraphDbRef<'a>> {
+    let Some(ctx) = class_ctx else {
+        return Ok(db);
+    };
+    if ctx.membership_g_ids.iter().all(|&g| g == db.g_id) {
+        return Ok(db);
+    }
+    if has_any_assertion(db, value).await? {
+        return Ok(db);
+    }
+    for &g in ctx.membership_g_ids {
+        if g == db.g_id {
+            continue;
+        }
+        let scoped = rescope_to_graph(db, g);
+        if has_any_assertion(scoped, value).await? {
+            return Ok(scoped);
+        }
+    }
+    Ok(db)
+}
+
+/// Whether `subject` has any asserted triple in `db`'s graph.
+///
+/// `range` suppresses retractions, so this is presence in the post-transaction
+/// view rather than "was ever written".
+async fn has_any_assertion(db: GraphDbRef<'_>, subject: &Sid) -> Result<bool> {
+    let flakes = db
+        .range_with_opts(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(subject.clone()),
+            RangeOptions::default().with_limit(1),
+        )
+        .await?;
+    Ok(!flakes.is_empty())
 }
 
 /// Rescope a `GraphDbRef` to a specific graph while preserving every other
