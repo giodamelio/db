@@ -16,6 +16,14 @@
 //! showed it. Ordering matters in every test here: the shapes graph is written
 //! first so it takes `g_id` 3, leaving the data graph at 4 while the
 //! transaction still calls it 3.
+//!
+//! A second defect sat behind that one, failing in the opposite direction.
+//! `sh:class` already resolves a value's `rdf:type` across the
+//! `f:shapesSource` graphs, which is what makes the "shared value-set" layout
+//! in `guides/cookbook-shacl.md` work. A nested shape reached through `sh:node`
+//! reads the value node's own triples, and read them from the focus graph only
+//! — so a controlled vocabulary held beside the shapes was invisible and every
+//! reference to it was refused as though the term were undeclared.
 
 #![cfg(all(feature = "native", feature = "shacl"))]
 
@@ -143,4 +151,171 @@ async fn a_conforming_node_in_a_second_named_graph_still_commits() {
         .execute()
         .await
         .expect("a conforming node in the second named graph must commit");
+}
+
+/// A controlled vocabulary beside the shapes, reached through `sh:node`.
+///
+/// `ex:status` is `sh:node`-constrained to `ex:InStatusScheme`, which asks for
+/// `ex:inScheme ex:StatusScheme` on the *value*. That triple lives in the shapes
+/// graph, the way `cookbook-shacl.md` lays out a shared value-set — the same
+/// arrangement `sh:class` already honours.
+fn scheme_shapes_and_config(ledger_id: &str) -> String {
+    let config_iri = config_graph_iri(ledger_id);
+    format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/> .
+
+        GRAPH <{SHAPES_GRAPH}> {{
+            ex:TaskShape rdf:type sh:NodeShape ;
+                         sh:targetClass ex:Task ;
+                         sh:property ex:pshape_status .
+            ex:pshape_status sh:path ex:status ;
+                             sh:minCount 1 ;
+                             sh:node ex:InStatusScheme .
+            ex:InStatusScheme rdf:type sh:NodeShape ;
+                              sh:property ex:pshape_scheme .
+            ex:pshape_scheme sh:path ex:inScheme ;
+                             sh:hasValue ex:StatusScheme .
+
+            ex:open ex:inScheme ex:StatusScheme .
+        }}
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true ;
+                               f:shapesSource <urn:config:shapes-ref> .
+            <urn:config:shapes-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:shapes-source> .
+            <urn:config:shapes-source> f:graphSelector <{SHAPES_GRAPH}> .
+        }}
+    "
+    )
+}
+
+async fn with_scheme_shapes(ledger_id: &str) -> (Fluree, LedgerState) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let result = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&scheme_shapes_and_config(ledger_id))
+        .execute()
+        .await
+        .expect("scheme shapes + config write");
+    (fluree, result.ledger)
+}
+
+/// **The value-node defect.**
+///
+/// `ex:open` is declared only in the shapes graph. Validating `ex:t1` in the
+/// data graph means evaluating `ex:open` against `ex:InStatusScheme`, and
+/// reading `ex:open` at the data graph finds nothing — so a task with a
+/// perfectly good status is refused for `sh:NodeConstraintComponent`.
+///
+/// Refused here means the documented shared-vocabulary layout is unusable for
+/// anything but `sh:class`.
+#[tokio::test]
+async fn a_value_nodes_vocabulary_may_live_in_the_shapes_graph() {
+    let (fluree, ledger) = with_scheme_shapes("it/shacl-value-vocab:main").await;
+
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex: <http://example.org/> .
+            GRAPH <{DATA_GRAPH}> {{
+                ex:t1 rdf:type ex:Task ;
+                      ex:status ex:open .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("a task citing a status declared in the shapes graph must commit");
+}
+
+/// The tripwire for the fix above: falling through to the vocabulary graphs
+/// must not become "accept anything".
+///
+/// `ex:bogus` is declared nowhere, so no graph describes it, and resolution
+/// stays on the data graph — where it has no `ex:inScheme` and the nested shape
+/// refuses it. If this ever commits, the value-set constraint has stopped
+/// constraining anything and the failure is silent.
+#[tokio::test]
+async fn a_value_node_no_graph_declares_is_still_refused() {
+    let (fluree, ledger) = with_scheme_shapes("it/shacl-value-bogus:main").await;
+
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex: <http://example.org/> .
+            GRAPH <{DATA_GRAPH}> {{
+                ex:t2 rdf:type ex:Task ;
+                      ex:status ex:bogus .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect_err("an undeclared status value was accepted");
+
+    assert!(
+        is_shacl_violation(&err),
+        "refused for some other reason than the shape: {err:?}"
+    );
+}
+
+/// Resolution, not union — the focus graph wins when it describes the value.
+///
+/// `ex:open` is declared in *both* graphs, and the data graph puts it in the
+/// wrong scheme. The nested shape must read the data graph's account and refuse,
+/// rather than stitch the two graphs together and find the shapes graph's
+/// `ex:StatusScheme` triple.
+///
+/// Without this, a data graph could never contradict the vocabulary — every
+/// term would silently fall back to whatever the shapes graph says.
+#[tokio::test]
+async fn the_focus_graph_wins_when_it_describes_the_value_node() {
+    let (fluree, ledger) = with_scheme_shapes("it/shacl-value-shadowed:main").await;
+
+    let result = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix ex: <http://example.org/> .
+            GRAPH <{DATA_GRAPH}> {{
+                ex:open ex:inScheme ex:OtherScheme .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("declaring ex:open in the data graph");
+
+    let err = fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex: <http://example.org/> .
+            GRAPH <{DATA_GRAPH}> {{
+                ex:t3 rdf:type ex:Task ;
+                      ex:status ex:open .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect_err("the shapes graph's account of ex:open overrode the data graph's");
+
+    assert!(
+        is_shacl_violation(&err),
+        "refused for some other reason than the shape: {err:?}"
+    );
 }
