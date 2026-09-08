@@ -131,6 +131,44 @@ const RESULT_SHAPING_CLAUSES: &[(&str, &str)] = &[
 /// makes this complementary to the reindex thresholds rather than a
 /// substitute — `reindex_min_bytes` is what bounds how much novelty a sync
 /// has to walk.
+/// Which graph in the ledger the indexing query reads.
+///
+/// An indexing query runs against one graph, not against a dataset: the ledger
+/// comes from the config rather than from a `from` clause, so `fromNamed` and
+/// `["graph", …]` patterns have no dataset to resolve against and match
+/// nothing. A ledger whose data lives in a named graph would therefore index
+/// zero documents, and every search against it return nothing — no error, no
+/// warning, just an empty index.
+///
+/// So the graph is named the same way [`crate::view::fluree_ext`] names one for
+/// a rules source: `"from": {"@id": …, "graph": "<IRI>"}`. Absent, or
+/// `"default"`, the default graph is read as before.
+///
+/// `None` means the ledger has no such graph, and the caller indexes nothing
+/// rather than falling back to the default graph — which is a different corpus,
+/// and would be silently wrong. Not an error: the registry gains a graph when
+/// something is first written to it, so an absent graph and an empty one are
+/// the same state, and the first index built in a new knowledge base would
+/// otherwise fail rather than come back empty.
+///
+/// It rides in the query because the query is what the nameservice already
+/// persists — a sync then reads the same graph the build did without a config
+/// migration, and picks the graph up once it exists.
+fn indexing_query_graph_id(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    query: &JsonValue,
+) -> Option<fluree_db_core::GraphId> {
+    let selector = query
+        .get("from")
+        .and_then(|from| from.get("graph"))
+        .and_then(JsonValue::as_str);
+
+    match selector {
+        None | Some("default") => Some(0),
+        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+    }
+}
+
 fn scope_indexing_query_to_subjects(
     query: &JsonValue,
     affected_iris: &HashSet<Arc<str>>,
@@ -396,7 +434,11 @@ impl crate::Fluree {
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
-        let db = ledger.as_graph_db_ref(0);
+        let Some(g_id) = indexing_query_graph_id(ledger.snapshot.as_ref(), query_json) else {
+            debug!("indexing query names a graph this ledger does not have yet; indexing nothing");
+            return Ok(Vec::new());
+        };
+        let db = ledger.as_graph_db_ref(g_id);
         let batches = execute(db, &vars, &executable, ContextConfig::default()).await?;
 
         // Format using the standard JSON-LD formatter
@@ -409,7 +451,7 @@ impl crate::Fluree {
             None,
         );
 
-        let json = result.to_jsonld_async(ledger.as_graph_db_ref(0)).await?;
+        let json = result.to_jsonld_async(ledger.as_graph_db_ref(g_id)).await?;
         match json {
             JsonValue::Array(arr) => Ok(arr),
             JsonValue::Object(_) => Ok(vec![json]),
