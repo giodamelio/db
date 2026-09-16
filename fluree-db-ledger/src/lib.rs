@@ -706,12 +706,15 @@ impl LedgerState {
         // novelty flakes still reference for encoding/decoding and graph routing.
         let mut merged_snapshot = new_snapshot;
         if has_remaining_novelty {
-            // Collect old graph IRIs before moving self.snapshot
-            let old_graph_iris: Vec<String> = self
+            // Collect old graph entries before moving self.snapshot — ids and
+            // all. Dropping the id here and re-registering the bare IRIs is what
+            // used to renumber every graph the root did not know about, and
+            // novelty is keyed by graph id.
+            let old_graph_entries: Vec<(fluree_db_core::ids::GraphId, String)> = self
                 .snapshot
                 .graph_registry
                 .iter_entries()
-                .map(|(_, iri)| iri.to_string())
+                .map(|(g_id, iri)| (g_id, iri.to_string()))
                 .collect();
 
             // Merge namespace codes: old entries not in new → carried forward
@@ -719,8 +722,41 @@ impl LedgerState {
                 merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
             }
 
-            // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
-            merged_snapshot.graph_registry.apply_delta(&old_graph_iris);
+            // Carry the old graphs forward keeping their ids, so the novelty
+            // still keyed by those ids keeps meaning the same thing.
+            let displaced = merged_snapshot
+                .graph_registry
+                .merge_preserving_ids(old_graph_entries.iter().map(|(id, iri)| (*id, iri.as_str())));
+            if !displaced.is_empty() {
+                // The root claimed an id this ledger had already given to
+                // something else. Nothing here can reconcile that — say so
+                // rather than let the rows quietly move.
+                tracing::warn!(
+                    ?displaced,
+                    "index root reused graph ids; novelty for those graphs may be misattributed"
+                );
+            }
+
+            // The other direction, and just as silent: the root knows the graph
+            // but numbered it differently. The merge leaves the root's id alone,
+            // because the indexed rows are keyed by it — which means the novelty
+            // still keyed by the old one now reads as another graph. Only the
+            // indexer can prevent this, by numbering graphs the way the registry
+            // does; if it reaches here, that has broken.
+            let moved: Vec<(fluree_db_core::ids::GraphId, &str)> = old_graph_entries
+                .iter()
+                .filter_map(|(old_id, iri)| {
+                    let now = merged_snapshot.graph_registry.graph_id_for_iri(iri)?;
+                    (now != *old_id).then_some((*old_id, iri.as_str()))
+                })
+                .collect();
+            if !moved.is_empty() {
+                tracing::warn!(
+                    ?moved,
+                    "index root numbered graphs differently from the ledger; \
+                     novelty for those graphs may be misattributed"
+                );
+            }
         }
 
         // Update state

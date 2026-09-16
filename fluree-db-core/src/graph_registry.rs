@@ -278,11 +278,66 @@ impl GraphRegistry {
         })
     }
 
+    /// Carry entries forward from a previous registry, **keeping their ids**.
+    ///
+    /// For re-seeding after an index is published. The new registry is built
+    /// from the index root and knows only the graphs that were indexed; every
+    /// graph registered since must be carried over, and carrying it over by IRI
+    /// alone is not enough — the id has to survive too.
+    ///
+    /// It has to survive because unindexed novelty is keyed by graph id. Feeding
+    /// the old IRIs through [`apply_delta`](Self::apply_delta) instead re-assigns
+    /// them in lexicographic order, which is not the order they were originally
+    /// assigned in (that was commit order, one graph at a time). Every id then
+    /// shifts, and rows committed under the old numbering are silently read as
+    /// belonging to a different graph. Not lost: *misfiled*.
+    ///
+    /// An entry whose IRI is already known is left alone — the new registry's
+    /// assignment wins, because the indexed rows are keyed by it. An entry whose
+    /// id is already taken by a *different* IRI cannot be preserved; it falls
+    /// back to a fresh id and is returned, so a caller can tell that identity was
+    /// not maintained rather than assuming it was.
+    pub fn merge_preserving_ids<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = (GraphId, &'a str)>,
+    ) -> Vec<(GraphId, Arc<str>)> {
+        let mut displaced: Vec<&str> = Vec::new();
+
+        for (g_id, iri) in entries {
+            if g_id == 0 || self.iri_to_id.contains_key(iri) {
+                continue;
+            }
+            let slot = g_id as usize;
+            if slot < self.id_to_iri.len() && self.id_to_iri[slot].is_some() {
+                // Taken by another IRI — the id cannot be honoured.
+                displaced.push(iri);
+                continue;
+            }
+
+            let arc: Arc<str> = Arc::from(iri);
+            if self.id_to_iri.len() <= slot {
+                self.id_to_iri.resize(slot + 1, None);
+            }
+            self.iri_to_id.insert(arc.clone(), g_id);
+            self.id_to_iri[slot] = Some(arc);
+            self.next_id = self.next_id.max(g_id + 1).max(FIRST_USER_GRAPH_ID);
+        }
+
+        // Whatever could not keep its id still has to be registered somehow.
+        self.apply_delta(displaced)
+    }
+
     /// Apply a delta of graph IRIs from a commit envelope.
     ///
     /// New IRIs (not already in registry) are deduped, sorted lexicographically,
     /// and assigned sequential GraphIds from `next_id`. Returns the newly assigned
     /// `(GraphId, Arc<str>)` pairs.
+    ///
+    /// Sorting makes a single batch deterministic, but it is **not** identity
+    /// preserving across batches: graphs originally assigned one-per-commit come
+    /// back in a different order if they are ever re-registered together. Use
+    /// [`merge_preserving_ids`](Self::merge_preserving_ids) when carrying an
+    /// existing registry forward.
     ///
     /// This is the **only mutation path** — called at commit-apply time only.
     pub fn apply_delta(
@@ -421,6 +476,81 @@ impl GraphRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-seeding from an index root must not move a graph the root never saw.
+    ///
+    /// The root knows only what was indexed. Everything registered since has to
+    /// be carried forward, and carrying it by IRI alone silently renumbered it:
+    /// `apply_delta` sorts, while the original ids were handed out one commit at
+    /// a time in commit order. Novelty is keyed by graph id, so every row
+    /// committed under the old numbering then read as another graph's.
+    ///
+    /// `sys` before `data` in commit order, `data` before `sys` alphabetically —
+    /// so a sorting merge swaps exactly this pair.
+    #[test]
+    fn merging_an_old_registry_keeps_the_ids_novelty_is_keyed_by() {
+        let ontology = "https://example.org/graph/ontology";
+        let sys = "https://example.org/graph/sys";
+        let data = "https://example.org/graph/data";
+
+        // The live registry, as commits built it: one graph per commit, on top
+        // of the two the ledger reserves.
+        let mut live = GraphRegistry::new_for_ledger("brain:main");
+        live.apply_delta([ontology]);
+        live.apply_delta([sys]);
+        live.apply_delta([data]);
+        let before: Vec<(GraphId, String)> = live
+            .iter_entries()
+            .map(|(id, iri)| (id, iri.to_string()))
+            .collect();
+        assert!(
+            live.graph_id_for_iri(sys) < live.graph_id_for_iri(data),
+            "the fixture needs sys registered before data, against alphabetical order"
+        );
+
+        // An index published covering only the ontology graph. A root's array is
+        // positional and always leads with the two reserved graphs, so the
+        // ontology keeps the id the ledger gave it.
+        let mut reseeded = GraphRegistry::seed_from_root_iris(&[
+            txn_meta_graph_iri("brain:main"),
+            config_graph_iri("brain:main"),
+            ontology.to_string(),
+        ])
+        .expect("seed");
+        let displaced =
+            reseeded.merge_preserving_ids(before.iter().map(|(id, iri)| (*id, iri.as_str())));
+
+        assert!(displaced.is_empty(), "nothing should have needed a new id");
+        for (id, iri) in &before {
+            assert_eq!(
+                reseeded.graph_id_for_iri(iri),
+                Some(*id),
+                "{iri} moved from {id} to {:?}",
+                reseeded.graph_id_for_iri(iri)
+            );
+        }
+    }
+
+    /// When the root has already claimed an id for a different graph, identity
+    /// cannot be kept — the caller has to be told rather than left believing it
+    /// was.
+    #[test]
+    fn a_graph_whose_id_the_root_reused_is_reported_rather_than_moved_silently() {
+        let taken = "https://example.org/graph/indexed";
+        let old = "https://example.org/graph/older";
+
+        let mut reseeded = GraphRegistry::seed_from_root_iris(&[taken.to_string()]).expect("seed");
+        let claimed = reseeded.graph_id_for_iri(taken).expect("registered");
+
+        let displaced = reseeded.merge_preserving_ids([(claimed, old)]);
+
+        assert_eq!(displaced.len(), 1, "the collision should be reported");
+        assert!(
+            reseeded.graph_id_for_iri(old).is_some(),
+            "it still has to be registered, just not at its old id"
+        );
+        assert_eq!(reseeded.graph_id_for_iri(taken), Some(claimed));
+    }
 
     #[test]
     fn test_txn_meta_graph_iri() {

@@ -23,6 +23,7 @@ use fluree_db_core::temporal::{
 };
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::DatatypeDictId;
+use fluree_db_core::TxnGraphId;
 use fluree_db_core::GraphId;
 use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
 use fluree_vocab::{db, fluree};
@@ -1341,6 +1342,35 @@ impl SharedResolverState {
         }
     }
 
+    /// Register a commit's graph IRIs, in the order the live registry uses.
+    ///
+    /// This must mirror [`GraphRegistry::apply_delta`] exactly, because the two
+    /// are two ways of numbering the same thing and a ledger runs on both. A
+    /// live ledger numbers user graphs as commits register them; an index
+    /// numbers them again while it is built, and publishing that index reseeds
+    /// the registry from the root positionally
+    /// (`GraphRegistry::seed_from_root_iris`). If the two orders disagree, every
+    /// graph id shifts the moment the index is attached — and because novelty is
+    /// keyed by graph id, rows committed under the old numbering are silently
+    /// read as belonging to a different graph. Not lost: *misfiled*.
+    ///
+    /// Hence sorted, matching `apply_delta`'s own "sort lexicographically for
+    /// deterministic assignment". Without this the indexer numbered graphs in
+    /// first-encounter order, which agrees with sorted order only by luck.
+    ///
+    /// The delta's keys are the authoring transaction's local ids and are
+    /// deliberately ignored: they are a third numbering, private to one
+    /// transaction. Only the IRIs cross between the two spaces.
+    ///
+    /// [`GraphRegistry::apply_delta`]: fluree_db_core::graph_registry::GraphRegistry::apply_delta
+    pub fn apply_graph_delta(&mut self, delta: &HashMap<TxnGraphId, String>) {
+        let mut iris: Vec<&str> = delta.values().map(String::as_str).collect();
+        iris.sort_unstable();
+        for iri in iris {
+            self.graphs.get_or_insert(iri);
+        }
+    }
+
     /// Seed [`fulltext_hook_config`](Self::fulltext_hook_config) from the
     /// caller-provided configured full-text properties.
     ///
@@ -1413,6 +1443,10 @@ impl SharedResolverState {
 
         // Apply namespace delta (forward order guarantees correctness).
         self.apply_namespace_delta(&commit_ops.envelope.namespace_delta);
+        // …and the graph delta, for the same reason and in the same place. Its
+        // absence is what let the index and the live registry number graphs
+        // differently; see `apply_graph_delta`.
+        self.apply_graph_delta(&commit_ops.envelope.graph_delta);
 
         let t = u32::try_from(commit_ops.t).map_err(|_| {
             ResolverError::Resolve(format!("commit t={} does not fit in u32", commit_ops.t))
