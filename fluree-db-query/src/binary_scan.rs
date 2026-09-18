@@ -3477,12 +3477,19 @@ fn resolve_string_v3(
     find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!(
-                "string not found in dict: {}",
-                &value[..value.len().min(50)]
-            ),
+            format!("string not found in dict: {}", head_of(value)),
         )
     })
+}
+
+/// The first 50 *characters* of a value, for a diagnostic.
+///
+/// Counted in characters because `&value[..value.len().min(50)]` panics
+/// whenever byte 50 falls inside a multi-byte character — so a value carrying
+/// one there aborted the request that was merely reporting a dictionary miss,
+/// instead of returning the `NotFound` this builds.
+fn head_of(value: &str) -> String {
+    value.chars().take(50).collect()
 }
 
 /// Convert a FlakeValue to `(OType, o_key)` in V3 encoding.
@@ -4360,6 +4367,33 @@ mod bounded_overlay_walk_tests {
 mod tests {
     use super::*;
     use fluree_db_core::{stats_view::GraphPropertyStatData, StatsView, ValueTypeTag};
+
+    /// A dictionary miss on a value whose byte 50 sits inside a multi-byte
+    /// character used to panic while building its own error message, taking
+    /// down the caller. An em dash padded to start at byte 48 spans 48..51, so
+    /// byte 50 is interior — the exact shape that reached this from a SHACL
+    /// validation during a SPARQL update.
+    #[test]
+    fn a_diagnostic_head_does_not_split_a_multibyte_character() {
+        for pad in 0..60 {
+            let value = format!("{}{}tail", "x".repeat(pad), '\u{2014}');
+            let head = head_of(&value);
+            assert!(
+                value.starts_with(&head) || head.chars().count() == 50,
+                "head {head:?} is not a prefix of {value:?}"
+            );
+            assert!(head.chars().count() <= 50);
+        }
+    }
+
+    /// Truncation counts characters, so a value of multi-byte characters keeps
+    /// 50 of them rather than being cut at some byte offset inside one.
+    #[test]
+    fn a_diagnostic_head_keeps_fifty_characters() {
+        let value = "\u{2014}".repeat(80);
+        assert_eq!(head_of(&value).chars().count(), 50);
+        assert_eq!(head_of("short").as_str(), "short");
+    }
 
     fn stats_with(
         datatypes: Vec<(ValueTypeTag, u64)>,
