@@ -161,3 +161,89 @@ async fn policy_applies_to_named_graph_queries() {
         })
         .await;
 }
+
+/// An `f:query` condition deciding a flake in a named graph must read that
+/// graph. The read path used to build its condition executor for the default
+/// graph, so every condition over named-graph data consulted the wrong graph:
+/// here that denies Alice, whose `ex:visible` is in `private`, and admits Bob,
+/// whose lookalike `ex:visible` sits in the default graph.
+#[tokio::test]
+async fn policy_condition_reads_the_named_graph_of_its_flake() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "policy/named-graph-conditions:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+            let trig = r#"
+                @prefix ex: <http://example.org/ns/> .
+                @prefix schema: <http://schema.org/> .
+
+                ex:bob ex:visible true .
+
+                GRAPH <http://example.org/graphs/private> {
+                    ex:alice schema:name "Alice" ; ex:visible true .
+                    ex:bob schema:name "Bob" .
+                }
+            "#;
+            let out = fluree
+                .stage_owned(ledger0)
+                .upsert_turtle(trig)
+                .execute()
+                .await
+                .expect("seed trig");
+
+            let completion = handle.trigger(ledger_id, out.receipt.t).await;
+            match completion.wait().await {
+                fluree_db_api::IndexOutcome::Completed { .. } => {}
+                other => panic!("indexing failed: {other:?}"),
+            }
+
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            let policy = json!([{
+                "@id": "ex:visibleNamesOnly",
+                "@type": "f:AccessPolicy",
+                "f:action": "f:view",
+                "f:onProperty": [{"@id": "http://schema.org/name"}],
+                "f:query": {
+                    "@type": "@json",
+                    "@value": {
+                        "where": {"@id": "?$this", "http://example.org/ns/visible": true}
+                    }
+                }
+            }]);
+
+            let query = json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/", "f": "https://ns.flur.ee/db#"},
+                "from": {"@id": ledger_id, "graph": "http://example.org/graphs/private"},
+                "opts": {"policy": policy, "default-allow": false},
+                "select": "?name",
+                "where": {"@id": "?s", "schema:name": "?name"}
+            });
+
+            let result = fluree
+                .query_connection(&query)
+                .await
+                .expect("query private names under a condition");
+            let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+            assert_eq!(
+                jsonld,
+                json!(["Alice"]),
+                "the condition must read the private graph, where only Alice is visible"
+            );
+        })
+        .await;
+}

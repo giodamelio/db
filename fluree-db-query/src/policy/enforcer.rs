@@ -116,7 +116,8 @@ impl QueryPolicyEnforcer {
         }
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
-        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        let executor =
+            QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
 
         let mut result = Vec::with_capacity(flakes.len());
 
@@ -183,7 +184,8 @@ impl QueryPolicyEnforcer {
         }
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
-        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        let executor =
+            QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
 
         // Get subject classes from cache
         let subject_classes = self
