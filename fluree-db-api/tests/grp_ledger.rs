@@ -43,3 +43,5 @@ mod it_stable_hashes;
 mod it_sync_graph;
 #[path = "it_sync_graph_rdf.rs"]
 mod it_sync_graph_rdf;
+#[path = "it_merge_graph_delta_collision.rs"]
+mod it_merge_graph_delta_collision;
