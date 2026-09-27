@@ -3922,7 +3922,7 @@ pub fn cursor_fast_path_for_predicate(
     // allow_unfiltered() == false implies a Some(non-root) enforcer; the None arm
     // is unreachable but kept total.
     match ctx.policy_enforcer.as_ref() {
-        Some(enforcer) => match enforcer.classify_view_predicate(pred_sid) {
+        Some(enforcer) => match enforcer.classify_view_predicate(pred_sid, &ctx.tracker) {
             PredicateCoverage::Covered => PredicateFastPath::Decline,
             PredicateCoverage::UncoveredAllow => PredicateFastPath::Allow,
             PredicateCoverage::UncoveredDeny => PredicateFastPath::Empty,

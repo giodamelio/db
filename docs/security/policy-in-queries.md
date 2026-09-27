@@ -107,7 +107,7 @@ Query-time rule injection (the query's `rules` field) is **admin-only**: under a
 
 ### Performance under a policy
 
-Enforcement runs per flake, so the engine's raw-row lanes — the binary index cursor, the batched leaflet probes, and the range semi-join's leaflet walk — cannot be used for a predicate the policy might touch. They stay on for predicates the policy provably cannot touch: a scan or probe of one fixed predicate keeps its lane when no `f:onProperty` rule names it and the default allows, and returns empty without reading anything when the default denies. Any `f:onClass`, `f:onSubject`, or default-target rule can apply to every predicate, so a policy containing one puts every scan on the filtered path. A policy made entirely of property rules therefore costs only on the properties it names.
+Enforcement runs per flake, so the engine's raw-row lanes — the binary index cursor, the batched leaflet probes, and the range semi-join's leaflet walk — cannot be used for a predicate the policy might touch. They stay on for predicates the policy provably cannot touch: a scan or probe of one fixed predicate keeps its lane when no `f:onProperty` rule names it and the default allows, and returns empty without reading anything when the default denies. A default-target rule with a fixed `f:allow` decides every flake it reaches the same way, so it does not cost a lane: an allow-everything rule plus property denies keeps every lane except for the denied properties. Any `f:onClass` or `f:onSubject` rule, or a default-target `f:query`, can decide flakes differently by subject, so a policy containing one puts every scan on the filtered path. A policy made of property rules and unconditional default rules therefore costs only on the properties it names. None of this applies while policy tracking is on: a tracked query evaluates every rule that reaches a flake so that it can report them.
 
 ## Targeting patterns
 
@@ -162,7 +162,7 @@ Restricts flakes about specific subjects:
 
 ### Default (no targeting)
 
-A policy with no `f:onProperty` / `f:onClass` / `f:onSubject` applies to **every** flake. Use sparingly — default policies are evaluated against every emitted flake, which is more expensive than targeted policies.
+A policy with no `f:onProperty` / `f:onClass` / `f:onSubject` applies to **every** flake. One with a fixed `f:allow` is decided once per predicate rather than per flake (see "Performance under a policy"). One with an `f:query` is evaluated against every emitted flake, which is more expensive than a targeted policy, so use those sparingly.
 
 ## SPARQL queries
 
@@ -237,7 +237,7 @@ fluree query --as ex:aliceIdentity --policy-class ex:CorpPolicy --at 2024-06-15T
 
 Two phases: load the policy set once per request; apply it to each touched flake.
 
-- **Target policies whenever possible.** A policy with `f:onProperty` only runs against flakes whose predicate matches. Default policies (no targeting) run against every flake.
+- **Target policies whenever possible.** A policy with `f:onProperty` only runs against flakes whose predicate matches. A default policy (no targeting) with an `f:query` runs against every flake.
 - **Keep `f:query` cheap.** It runs once per flake-target. Lean on identity-side properties already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
 - **Avoid deep recursion in `f:query`.** Each level of indirection multiplies the per-flake cost.
 - **Required policies short-circuit on the first failed gate.** Required policies are AND gates — every one must grant. As soon as any required gate fails (an explicit deny, or an `f:query` returning no rows), the flake is denied and the remaining required policies are skipped.

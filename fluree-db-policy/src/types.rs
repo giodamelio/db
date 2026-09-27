@@ -519,6 +519,75 @@ impl PolicySet {
             || !self.by_subject.is_empty()
             || !self.defaults.is_empty()
     }
+
+    /// The decision every flake with predicate `p` gets, when it is the same
+    /// whatever the flake's subject, classes or object — `None` when it is not.
+    ///
+    /// [`covers_predicate`](Self::covers_predicate) answers this only when no
+    /// rule at all could apply. An untargeted rule applies to everything, so
+    /// under one every predicate is covered, even though an unconditional
+    /// untargeted rule decides all its flakes the same way. That is the common
+    /// shape of a broad grant with narrow exceptions — an allow-all plus
+    /// property- or class-targeted denies — and a covered predicate costs more
+    /// than its evaluation: a scan that may have to filter gives up the index
+    /// cursor for a fallback that collects and decodes its whole range.
+    ///
+    /// It is decidable from the predicate exactly when the only candidates
+    /// [`policy_entries_for_flake`](Self::policy_entries_for_flake) could
+    /// return are `defaults`: nothing in `by_property` for `p`, and nothing in
+    /// the predicate-agnostic `by_class` or `by_subject`. Default entries never
+    /// need a class check, so every one applies, and what follows mirrors the
+    /// combining in `evaluate_flake_async`: the required subset if there is
+    /// one, deny overrides, then every required gate must be an allow, or any
+    /// allow grants. An `f:query` depends on the subject, so where one could
+    /// decide the outcome the answer is `None`.
+    ///
+    /// A schema predicate is decided only when the answer is allow. The schema
+    /// bypass admits some of its flakes before any rule runs, so a deny would
+    /// be wrong for those and which they are depends on the object.
+    pub fn static_decision_for_predicate(&self, p: &Sid, default_allow: bool) -> Option<bool> {
+        let decision = self.static_decision_ignoring_schema(p, default_allow);
+        if crate::schema::is_schema_predicate(p) {
+            return decision.filter(|&allowed| allowed);
+        }
+        decision
+    }
+
+    fn static_decision_ignoring_schema(&self, p: &Sid, default_allow: bool) -> Option<bool> {
+        if self.by_property.contains_key(p)
+            || !self.by_class.is_empty()
+            || !self.by_subject.is_empty()
+        {
+            return None;
+        }
+
+        let has_required = self
+            .defaults
+            .iter()
+            .any(|&idx| self.restrictions[idx].required);
+        let applicable: Vec<&PolicyRestriction> = self
+            .defaults
+            .iter()
+            .map(|&idx| &self.restrictions[idx])
+            .filter(|restriction| !has_required || restriction.required)
+            .collect();
+
+        if applicable.is_empty() {
+            return Some(default_allow);
+        }
+        if applicable
+            .iter()
+            .any(|restriction| matches!(restriction.value, PolicyValue::Deny))
+        {
+            return Some(false);
+        }
+        let is_allow =
+            |restriction: &&PolicyRestriction| matches!(restriction.value, PolicyValue::Allow);
+        if has_required {
+            return applicable.iter().all(is_allow).then_some(true);
+        }
+        applicable.iter().any(is_allow).then_some(true)
+    }
 }
 
 /// Inner data for PolicyWrapper (Arc-wrapped for cheap cloning)

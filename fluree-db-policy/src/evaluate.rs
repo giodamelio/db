@@ -1672,4 +1672,281 @@ mod tests {
 
         assert!(result);
     }
+
+    /// One of each kind of view rule a policy set can hold, built through the
+    /// real indexer. The class rule's stats have both `Key` and `Other` using
+    /// `p1`, so it lands on `p1` with a runtime class check. The untargeted
+    /// condition comes ahead of the untargeted allow, so a static decision that
+    /// looked only at the first rule would miss the grant.
+    fn rule_kinds() -> Vec<(&'static str, PolicyRestriction)> {
+        use crate::types::{ConditionState, PolicyQuery, PolicyQueryLanguage};
+
+        let rule = |id: &'static str, mode, value, required, targets: &[Sid], classes: &[Sid]| {
+            (
+                id,
+                PolicyRestriction {
+                    id: id.to_string(),
+                    target_mode: mode,
+                    targets: targets.iter().cloned().collect(),
+                    action: PolicyAction::View,
+                    verbs: None,
+                    value,
+                    required,
+                    message: None,
+                    class_policy: mode == TargetMode::OnClass,
+                    for_classes: classes.iter().cloned().collect(),
+                    class_check_needed: mode == TargetMode::OnClass,
+                },
+            )
+        };
+        let query = || {
+            PolicyValue::Query(PolicyQuery {
+                source: "ASK { FILTER(true) }".to_string(),
+                language: PolicyQueryLanguage::Sparql,
+                state: ConditionState::Pre,
+            })
+        };
+        let (p1, s1, key) = (
+            make_sid(100, "p1"),
+            make_sid(100, "s1"),
+            make_sid(100, "Key"),
+        );
+        vec![
+            rule("query", TargetMode::Default, query(), false, &[], &[]),
+            rule(
+                "allow",
+                TargetMode::Default,
+                PolicyValue::Allow,
+                false,
+                &[],
+                &[],
+            ),
+            rule(
+                "deny",
+                TargetMode::Default,
+                PolicyValue::Deny,
+                false,
+                &[],
+                &[],
+            ),
+            rule(
+                "req-allow",
+                TargetMode::Default,
+                PolicyValue::Allow,
+                true,
+                &[],
+                &[],
+            ),
+            rule(
+                "req-deny",
+                TargetMode::Default,
+                PolicyValue::Deny,
+                true,
+                &[],
+                &[],
+            ),
+            rule("req-query", TargetMode::Default, query(), true, &[], &[]),
+            rule(
+                "p1-allow",
+                TargetMode::OnProperty,
+                PolicyValue::Allow,
+                false,
+                std::slice::from_ref(&p1),
+                &[],
+            ),
+            rule(
+                "p1-deny",
+                TargetMode::OnProperty,
+                PolicyValue::Deny,
+                true,
+                &[p1],
+                &[],
+            ),
+            rule(
+                "key-deny",
+                TargetMode::OnClass,
+                PolicyValue::Deny,
+                true,
+                &[],
+                &[key],
+            ),
+            rule(
+                "s1-deny",
+                TargetMode::OnSubject,
+                PolicyValue::Deny,
+                true,
+                &[s1],
+                &[],
+            ),
+        ]
+    }
+
+    fn view_context(rules: Vec<PolicyRestriction>, default_allow: bool) -> PolicyContext {
+        use fluree_db_core::{ClassPropertyUsage, ClassStatEntry, IndexStats};
+
+        let uses_p1 = |class: &str| ClassStatEntry {
+            class_sid: make_sid(100, class),
+            count: 1,
+            properties: vec![ClassPropertyUsage {
+                property_sid: make_sid(100, "p1"),
+                datatypes: Vec::new(),
+                langs: Vec::new(),
+                ref_classes: Vec::new(),
+            }],
+        };
+        let stats = IndexStats {
+            flakes: 0,
+            size: 0,
+            properties: None,
+            classes: Some(vec![uses_p1("Key"), uses_p1("Other")]),
+            graphs: None,
+            historical_since_t: None,
+        };
+        let view = crate::index::build_policy_set(rules, Some(&stats), PolicyAction::View, None);
+        let wrapper = PolicyWrapper::new(
+            view,
+            PolicySet::new(),
+            false,
+            default_allow,
+            std::collections::HashMap::new(),
+        );
+        PolicyContext::new(wrapper, None)
+    }
+
+    /// Answers every condition the same way, so a verdict that depends on one
+    /// shows up as a disagreement between the two answers.
+    struct Answers(bool);
+
+    impl PolicyQueryExecutor for Answers {
+        fn evaluate_policy_query<'a>(
+            &'a self,
+            _query: &'a crate::types::PolicyQuery,
+            _bindings: &'a std::collections::HashMap<String, FlakeValue>,
+        ) -> crate::PolicyQueryFut<'a> {
+            let answer = self.0;
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    /// Wherever a predicate's decision is taken without evaluating, it must be
+    /// the decision evaluating would have reached, for every subject, class set
+    /// and object, and whatever a condition answers. Checked over every set of
+    /// up to three rule kinds, both fallbacks, and flakes varying on each axis
+    /// a rule can target, against both evaluators.
+    #[tokio::test]
+    async fn a_static_decision_always_agrees_with_evaluation() {
+        let kinds = rule_kinds();
+        let predicates = [
+            make_sid(100, "p1"),
+            make_sid(100, "p2"),
+            Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::predicates::RDF_TYPE,
+            ),
+        ];
+        let subjects = [make_sid(100, "s1"), make_sid(100, "s2")];
+        let class_sets = [
+            vec![],
+            vec![make_sid(100, "Key")],
+            vec![make_sid(100, "Other")],
+        ];
+        // `rdf:type owl:Class` is a schema flake, admitted before any rule
+        // runs; an ordinary object is not.
+        let objects = [
+            FlakeValue::Ref(make_sid(100, "o")),
+            FlakeValue::Ref(Sid::new(fluree_vocab::namespaces::OWL, "Class")),
+        ];
+
+        let mut decided = 0;
+        for mask in 0u32..(1 << kinds.len()) {
+            if mask.count_ones() > 3 {
+                continue;
+            }
+            let chosen: Vec<_> = kinds
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, kind)| kind)
+                .collect();
+            let names: Vec<_> = chosen.iter().map(|(name, _)| *name).collect();
+            let rules: Vec<_> = chosen.iter().map(|(_, rule)| rule.clone()).collect();
+
+            for default_allow in [false, true] {
+                let ctx = view_context(rules.clone(), default_allow);
+                for predicate in &predicates {
+                    let Some(verdict) = ctx
+                        .wrapper()
+                        .view()
+                        .static_decision_for_predicate(predicate, default_allow)
+                    else {
+                        continue;
+                    };
+                    decided += 1;
+                    for subject in &subjects {
+                        for classes in &class_sets {
+                            for object in &objects {
+                                let case = format!(
+                                    "rules {names:?}, default_allow {default_allow}, \
+                                     {predicate:?} {object:?} on {subject:?} as {classes:?}"
+                                );
+                                let sync = ctx
+                                    .allow_view_flake(subject, predicate, object, classes)
+                                    .unwrap();
+                                assert_eq!(verdict, sync, "sync: {case}");
+                                for answer in [false, true] {
+                                    let evaluated = ctx
+                                        .allow_view_flake_async(
+                                            subject,
+                                            predicate,
+                                            object,
+                                            classes,
+                                            &Answers(answer),
+                                            &Tracker::disabled(),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    assert_eq!(
+                                        verdict, evaluated,
+                                        "async, conditions answering {answer}: {case}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decided > 0, "no predicate was ever decided statically");
+    }
+
+    /// The shape the fast path is for: a broad grant with a narrow exception.
+    /// A predicate the exception does not reach is decided without evaluating,
+    /// and so is one reached by a condition as well as the grant, since the
+    /// grant wins whatever the condition answers.
+    #[test]
+    fn a_broad_grant_decides_the_predicates_its_exception_cannot_reach() {
+        let kinds = rule_kinds();
+        let pick = |name| kinds.iter().find(|(n, _)| *n == name).unwrap().1.clone();
+
+        let ctx = view_context(vec![pick("allow"), pick("key-deny")], false);
+        let view = ctx.wrapper().view();
+        assert_eq!(
+            view.static_decision_for_predicate(&make_sid(100, "p2"), false),
+            Some(true)
+        );
+        assert_eq!(
+            view.static_decision_for_predicate(&make_sid(100, "p1"), false),
+            None,
+            "the class deny reaches p1, so p1 must be evaluated"
+        );
+
+        let ctx = view_context(vec![pick("query"), pick("allow")], false);
+        assert_eq!(
+            ctx.wrapper()
+                .view()
+                .static_decision_for_predicate(&make_sid(100, "p2"), false),
+            Some(true),
+            "a condition ahead of the grant cannot take its allow away"
+        );
+    }
 }

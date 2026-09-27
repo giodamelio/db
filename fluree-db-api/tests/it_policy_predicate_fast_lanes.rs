@@ -6,7 +6,9 @@
 //! statically known predicate stays on when the view set provably cannot
 //! touch that predicate (`covers_predicate` is false and the default allows),
 //! short-circuits to empty when it cannot touch it and the default denies,
-//! and falls back to the filtered path otherwise.
+//! and falls back to the filtered path otherwise. A predicate only
+//! unconditional untargeted rules reach is treated the same way, by the
+//! decision they reach (`static_decision_for_predicate`).
 //!
 //! Every case pins routing with the `fast-path outcome` stamps, not just the
 //! answer: the filtered fallback computes the same rows, so a lane that
@@ -274,6 +276,91 @@ async fn property_rule_keeps_lanes_for_untouched_predicates() {
     )
     .await;
     assert_eq!(row_count(&joined_ssn), 0, "{joined_ssn}");
+
+    drop(guard);
+}
+
+/// An allow-everything rule with one required exception, under a deny
+/// default — the usual shape of a broad grant. The untargeted allow reaches
+/// every predicate, so `covers_predicate` reports all of them covered; only
+/// `ex:ssn` can come out differently, and only its lanes may fall back. A
+/// count is asked too, since it reads the same predicate by another operator.
+#[tokio::test(flavor = "current_thread")]
+async fn broad_grant_keeps_lanes_for_everything_but_its_exception() {
+    let fluree = indexed_people().await;
+    let mut policy = deny_ssn();
+    policy.as_array_mut().expect("rules").push(json!({
+        "@id": format!("{EX}allowEverything"),
+        "f:action": "f:view",
+        "f:allow": true
+    }));
+    let view = policed_view(&fluree, policy, false).await;
+    let (store, guard) = init_test_tracing();
+
+    let names = run(
+        &fluree,
+        &view,
+        &store,
+        &json!({"@context": {"ex": EX}, "select": "?n", "where": {"@id": "?s", "ex:name": "?n"}}),
+        SCAN_SITE,
+        Lane::MustFire,
+        "scan ex:name under a broad grant",
+    )
+    .await;
+    assert_eq!(row_count(&names), 3, "{names}");
+
+    let ssn = run(
+        &fluree,
+        &view,
+        &store,
+        &json!({"@context": {"ex": EX}, "select": "?v", "where": {"@id": "?s", "ex:ssn": "?v"}}),
+        SCAN_SITE,
+        Lane::MustNotFire,
+        "scan ex:ssn under a broad grant",
+    )
+    .await;
+    assert_eq!(row_count(&ssn), 0, "{ssn}");
+
+    let joined = run(
+        &fluree,
+        &view,
+        &store,
+        QueryInput::Sparql(
+            "SELECT ?n ?a WHERE { ?s <http://example.org/ns/name> ?n . ?s <http://example.org/ns/age> ?a }",
+        ),
+        PROBE_SITE,
+        Lane::MustFire,
+        "probe ex:age under a broad grant",
+    )
+    .await;
+    assert_eq!(row_count(&joined), 3, "{joined}");
+
+    let joined_ssn = run(
+        &fluree,
+        &view,
+        &store,
+        QueryInput::Sparql(
+            "SELECT ?n ?v WHERE { ?s <http://example.org/ns/name> ?n . ?s <http://example.org/ns/ssn> ?v }",
+        ),
+        PROBE_SITE,
+        Lane::MustNotFire,
+        "probe ex:ssn under a broad grant",
+    )
+    .await;
+    assert_eq!(row_count(&joined_ssn), 0, "{joined_ssn}");
+
+    let counted = fluree
+        .query(
+            &view,
+            QueryInput::Sparql(
+                "SELECT (COUNT(?v) AS ?c) WHERE { ?s <http://example.org/ns/ssn> ?v }",
+            ),
+        )
+        .await
+        .expect("count ex:ssn")
+        .to_jsonld(&view.snapshot)
+        .expect("jsonld");
+    assert_eq!(counted, json!([[0]]), "a count of the exception saw rows");
 
     drop(guard);
 }

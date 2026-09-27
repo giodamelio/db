@@ -16,14 +16,15 @@ use std::sync::Arc;
 /// (see [`PolicySet::covers_predicate`](fluree_db_policy::PolicySet::covers_predicate)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredicateCoverage {
-    /// A view restriction may apply to flakes with this predicate; the per-flake
-    /// filtered scan fallback is required.
+    /// Whether a flake with this predicate is visible depends on the flake;
+    /// the per-flake filtered scan fallback is required.
     Covered,
-    /// No restriction can apply and the effective default is allow — every flake
-    /// with this predicate is visible, so a fast path may run unfiltered.
+    /// Every flake with this predicate is visible, whatever its subject or
+    /// object — no rule reaches it and the default is allow, or only
+    /// unconditional allows do — so a fast path may run unfiltered.
     UncoveredAllow,
-    /// No restriction can apply and the effective default is deny — every flake
-    /// with this predicate is hidden, so the result for it is empty.
+    /// Every flake with this predicate is hidden, so the result for it is
+    /// empty.
     UncoveredDeny,
 }
 
@@ -68,17 +69,27 @@ impl QueryPolicyEnforcer {
     /// [`ExecutionContext::allow_unfiltered`](crate::context::ExecutionContext::allow_unfiltered)
     /// before reaching here, so the root arm is only a defensive fallback (it
     /// forces the filtered path, which is correct — just slower — for root).
-    pub fn classify_view_predicate(&self, predicate: &Sid) -> PredicateCoverage {
+    ///
+    /// Beyond predicates no rule reaches, a predicate is settled when only
+    /// unconditional untargeted rules reach it
+    /// ([`PolicySet::static_decision_for_predicate`](fluree_db_policy::PolicySet::static_decision_for_predicate)).
+    /// Not while policy is being tracked: the counters report the rules that
+    /// ran, so only a predicate no rule reaches may skip running them.
+    pub fn classify_view_predicate(&self, predicate: &Sid, tracker: &Tracker) -> PredicateCoverage {
         let wrapper = self.policy.wrapper();
         if wrapper.is_root() {
             return PredicateCoverage::Covered;
         }
-        if wrapper.view().covers_predicate(predicate) {
-            PredicateCoverage::Covered
-        } else if wrapper.default_allow() {
-            PredicateCoverage::UncoveredAllow
+        let view = wrapper.view();
+        let verdict = if tracker.tracks_policy() {
+            (!view.covers_predicate(predicate)).then(|| wrapper.default_allow())
         } else {
-            PredicateCoverage::UncoveredDeny
+            view.static_decision_for_predicate(predicate, wrapper.default_allow())
+        };
+        match verdict {
+            None => PredicateCoverage::Covered,
+            Some(true) => PredicateCoverage::UncoveredAllow,
+            Some(false) => PredicateCoverage::UncoveredDeny,
         }
     }
 
@@ -119,14 +130,30 @@ impl QueryPolicyEnforcer {
         let executor =
             QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
 
-        let subjects: Vec<Sid> = flakes.iter().map(|flake| flake.s.clone()).collect();
+        let verdicts = self.static_verdicts(&flakes, tracker);
+
+        let subjects: Vec<Sid> = flakes
+            .iter()
+            .zip(&verdicts)
+            .filter(|(_, verdict)| verdict.is_none())
+            .map(|(flake, _)| flake.s.clone())
+            .collect();
         let scope = self
             .resolve_classes(snapshot, g_id, overlay, to_t, &subjects)
             .await?;
 
         let mut result = Vec::with_capacity(flakes.len());
 
-        for flake in flakes {
+        for (flake, verdict) in flakes.into_iter().zip(verdicts) {
+            match verdict {
+                Some(true) => {
+                    result.push(flake);
+                    continue;
+                }
+                Some(false) => continue,
+                None => {}
+            }
+
             // Schema flakes always allowed
             if is_schema_flake(&flake.p, &flake.o) {
                 result.push(flake);
@@ -217,6 +244,33 @@ impl QueryPolicyEnforcer {
             )
             .await
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
+    }
+
+    /// Each flake's decision where its predicate alone settles it, and `None`
+    /// where it has to be evaluated.
+    ///
+    /// Decided once per predicate in the batch, since a scan batch is usually
+    /// one predicate. Not used while policy is being tracked: the per-policy
+    /// counters report the rules that ran, and a decision taken without
+    /// running them would change what a tracked query says about itself.
+    fn static_verdicts(&self, flakes: &[Flake], tracker: &Tracker) -> Vec<Option<bool>> {
+        if tracker.tracks_policy() {
+            return vec![None; flakes.len()];
+        }
+        let view = self.policy.wrapper().view();
+        let default_allow = self.policy.wrapper().default_allow();
+        let mut by_predicate: Vec<(&Sid, Option<bool>)> = Vec::new();
+        flakes
+            .iter()
+            .map(|flake| {
+                if let Some((_, verdict)) = by_predicate.iter().find(|(p, _)| **p == flake.p) {
+                    return *verdict;
+                }
+                let verdict = view.static_decision_for_predicate(&flake.p, default_allow);
+                by_predicate.push((&flake.p, verdict));
+                verdict
+            })
+            .collect()
     }
 
     /// Make sure every subject's classes are cached for this snapshot and graph,
