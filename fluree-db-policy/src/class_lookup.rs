@@ -108,21 +108,28 @@ pub async fn populate_class_cache(
         return Ok(());
     }
 
-    // Key on the graph this ref reads, so classes resolved in one graph are never
-    // consulted for a decision about another.
+    // Key on the snapshot and graph this ref reads, so classes resolved in one
+    // are never consulted for a decision about another.
+    let scope = crate::ClassScope::new(&db.snapshot.ledger_id, db.t);
     let g_id = db.g_id;
     // Only resolve subjects this context has not already cached: the scan
     // operator populates per batch and hydration re-asks per subject fetch, so
     // without this every subject pays the index lookup (a leaflet decode) at
     // least twice.
-    let uncached = policy_ctx.retain_uncached(g_id, db.t, subjects);
+    let mut uncached = policy_ctx.retain_uncached(scope, g_id, subjects);
     if uncached.is_empty() {
         return Ok(());
     }
-    let class_map = lookup_subject_classes(&uncached, db).await?;
+    uncached.sort();
+    uncached.dedup();
+    let mut class_map = lookup_subject_classes(&uncached, db).await?;
 
-    for (subject, classes) in class_map {
-        policy_ctx.cache_subject_classes(g_id, db.t, subject, classes);
+    // A subject with no `rdf:type` is absent from the map. It is cached as
+    // having none, which is an answer, rather than left a miss to be looked up
+    // again on every probe.
+    for subject in uncached {
+        let classes = class_map.remove(&subject).unwrap_or_default();
+        policy_ctx.cache_subject_classes(scope, g_id, subject, classes);
     }
 
     Ok(())

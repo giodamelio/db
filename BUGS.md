@@ -99,6 +99,26 @@ that. Its regression tests were kept, and pass against upstream's fix.
   - Fix: *fix(query): read a policy condition from its flake's named graph*.
   - Tests: `it_policy_named_graphs::policy_condition_reads_the_named_graph_of_its_flake`.
 
+- **A class rule could be judged against another ledger's classes.**
+  - What happened: the class cache is keyed on graph, `t` and `Sid`, and its
+    documentation says a context must never span two ledgers. A dataset query
+    does exactly that: `apply_policy_to_dataset` attaches one context to every
+    view. The same `Sid` at the same `t` in a second ledger is then skipped as
+    already resolved and judged with the first ledger's classes. Failed
+    **open** under a class grant.
+  - Status: shown at the enforcer, not yet through a dataset query.
+  - Also: the filters read a miss as "no classes", which stops a class deny
+    applying. Every upstream caller populates first, so this is latent there.
+    Subjects with no `rdf:type` were never cached, and were looked up again on
+    every probe.
+  - Fix: *fix(policy): resolve a flake's classes where it is judged, and only
+    once*.
+  - Tests (in `fluree-db-query`'s `policy::enforcer`):
+    - `a_class_grant_in_one_ledger_does_not_reach_another`
+    - `a_subject_cached_from_one_ledger_does_not_answer_for_another`
+    - `a_class_deny_applies_when_nothing_populated_the_cache`
+    - `a_subject_with_no_classes_is_cached_as_having_none`
+
 ## Fixed upstream; this fork's regression test kept
 
 Each of these was fixed here first, and upstream fixed it independently. The
