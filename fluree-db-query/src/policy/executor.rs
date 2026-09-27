@@ -6,6 +6,7 @@ use crate::binding::Binding;
 use crate::context::ExecutionContext;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
+use crate::var_registry::VarId;
 use crate::var_registry::VarRegistry;
 use fluree_db_core::{
     DatatypeConstraint, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid,
@@ -17,6 +18,7 @@ use fluree_db_policy::{
 use fluree_vocab::namespaces::{EMPTY, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Policy query executor that runs queries against a database
 ///
@@ -44,6 +46,27 @@ pub struct QueryPolicyExecutor<'a> {
     /// the very subjects the transaction is introducing. Falls back to
     /// `snapshot` when absent.
     pub post_snapshot: Option<&'a LedgerSnapshot>,
+    /// SPARQL conditions already lowered against `snapshot`, by source.
+    ///
+    /// A condition is asked once per flake it judges, and lowering it was a
+    /// quarter of what each ask cost. What lowering produces depends on the
+    /// source and on the snapshot IRIs are encoded against — never on the
+    /// bindings, which are seeded afterwards as a VALUES row — so it is done
+    /// once per executor, which is to say once per snapshot.
+    prepared: Mutex<HashMap<String, Arc<PreparedSparql>>>,
+}
+
+/// A lowered SPARQL condition and the variables its bindings seed.
+struct PreparedSparql {
+    vars: VarRegistry,
+    patterns: Vec<Pattern>,
+    /// The binding names it was prepared for, sorted. A call with any other
+    /// set lowers afresh rather than seeding the wrong variables.
+    names: Vec<String>,
+    /// For each VALUES column, its variable and the binding that fills it.
+    /// Two names can register as one variable (`?$this` and `?this`); the
+    /// first in sorted order fills it, as it did before preparation.
+    columns: Vec<(VarId, usize)>,
 }
 
 impl<'a> QueryPolicyExecutor<'a> {
@@ -57,6 +80,7 @@ impl<'a> QueryPolicyExecutor<'a> {
             post_overlay: None,
             post_to_t: snapshot.t,
             post_snapshot: None,
+            prepared: Mutex::default(),
         }
     }
 
@@ -74,6 +98,7 @@ impl<'a> QueryPolicyExecutor<'a> {
             post_overlay: None,
             post_to_t: to_t,
             post_snapshot: None,
+            prepared: Mutex::default(),
         }
     }
 
@@ -468,6 +493,48 @@ impl QueryPolicyExecutor<'_> {
         bindings: &HashMap<String, FlakeValue>,
         state: ConditionState,
     ) -> PolicyResult<bool> {
+        let mut names: Vec<&String> = bindings.keys().collect();
+        names.sort();
+        let prepared = self.prepared_sparql(source, &names)?;
+
+        // Seed special variables with a VALUES pattern, mirroring the JSON-LD
+        // path's injected VALUES clause.
+        let row = prepared
+            .columns
+            .iter()
+            .map(|&(_, name)| binding_for_value(&bindings[names[name]]))
+            .collect();
+        let mut patterns = Vec::with_capacity(prepared.patterns.len() + 1);
+        patterns.push(Pattern::Values {
+            vars: prepared.columns.iter().map(|&(var, _)| var).collect(),
+            rows: vec![row],
+        });
+        patterns.extend(prepared.patterns.iter().cloned());
+
+        self.run_existence_check(&prepared.vars, &patterns, state)
+            .await
+    }
+
+    /// `source` lowered against this executor's snapshot, with the variables
+    /// the bindings `names` seed — from the cache when it was lowered before
+    /// for the same names.
+    fn prepared_sparql(
+        &self,
+        source: &str,
+        names: &[&String],
+    ) -> PolicyResult<Arc<PreparedSparql>> {
+        let cached = self
+            .prepared
+            .lock()
+            .map_err(|_| fluree_db_policy::PolicyError::QueryExecution {
+                message: "SPARQL condition cache lock poisoned".to_string(),
+            })?
+            .get(source)
+            .cloned();
+        if let Some(prepared) = cached.filter(|p| p.names.iter().eq(names.iter().copied())) {
+            return Ok(prepared);
+        }
+
         let support = crate::lang_support::sparql_support().ok_or_else(|| {
             fluree_db_policy::PolicyError::QueryExecution {
                 message: "SPARQL policy support is not registered in this process; \
@@ -477,42 +544,36 @@ impl QueryPolicyExecutor<'_> {
         })?;
 
         let mut vars = VarRegistry::new();
-        let mut patterns =
+        let patterns =
             (support.lower_policy_query)(source, self.snapshot, &mut vars).map_err(|e| {
                 fluree_db_policy::PolicyError::QueryExecution {
                     message: format!("Failed to parse SPARQL policy query: {e}"),
                 }
             })?;
 
-        // Seed special variables with a VALUES pattern, mirroring the JSON-LD
-        // path's injected VALUES clause. Binding keys arrive in JSON-LD form
-        // (`?$this`); the SPARQL query references them as `$this`/`?this`,
-        // registered as `?this`.
-        let mut var_names: Vec<String> = bindings.keys().cloned().collect();
-        var_names.sort();
-
-        let mut var_ids = Vec::with_capacity(var_names.len());
-        let mut row = Vec::with_capacity(var_names.len());
-        for name in &var_names {
-            let var_id = vars.get_or_insert(&sparql_var_name(name));
-            if var_ids.contains(&var_id) {
-                continue;
+        // Binding keys arrive in JSON-LD form (`?$this`); the SPARQL query
+        // references them as `$this`/`?this`, registered as `?this`.
+        let mut columns: Vec<(VarId, usize)> = Vec::with_capacity(names.len());
+        for (index, name) in names.iter().enumerate() {
+            let var = vars.get_or_insert(&sparql_var_name(name));
+            if !columns.iter().any(|&(seen, _)| seen == var) {
+                columns.push((var, index));
             }
-            let value = bindings.get(name).expect("binding value exists");
-            var_ids.push(var_id);
-            // Unbound identity seeds as UNDEF, same as the JSON-LD path's
-            // null VALUES cell.
-            row.push(binding_for_value(value));
         }
-        patterns.insert(
-            0,
-            Pattern::Values {
-                vars: var_ids,
-                rows: vec![row],
-            },
-        );
 
-        self.run_existence_check(&vars, &patterns, state).await
+        let prepared = Arc::new(PreparedSparql {
+            vars,
+            patterns,
+            names: names.iter().map(|name| (*name).clone()).collect(),
+            columns,
+        });
+        self.prepared
+            .lock()
+            .map_err(|_| fluree_db_policy::PolicyError::QueryExecution {
+                message: "SPARQL condition cache lock poisoned".to_string(),
+            })?
+            .insert(source.to_string(), Arc::clone(&prepared));
+        Ok(prepared)
     }
 
     /// Execute WHERE patterns with a root (policy-free) context and report
@@ -646,5 +707,148 @@ mod tests {
         // A regular ref seeds itself.
         let real = FlakeValue::Ref(Sid::new(XSD, "someSubject"));
         assert!(matches!(binding_for_value(&real), Binding::Sid { .. }));
+    }
+
+    use crate::ir::{Ref, Term, TriplePattern};
+    use fluree_db_core::{Flake, IndexType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LOWERINGS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Stands in for the SPARQL layer: `ASK { $this <ok> ?o }`, whatever the
+    /// source says, counting how often it is asked to lower.
+    fn lower_this_is_ok(
+        _source: &str,
+        _snapshot: &LedgerSnapshot,
+        vars: &mut VarRegistry,
+    ) -> Result<Vec<Pattern>, String> {
+        LOWERINGS.fetch_add(1, Ordering::SeqCst);
+        let this = vars.get_or_insert("?this");
+        let o = vars.get_or_insert("?o");
+        Ok(vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(this),
+            Ref::Sid(Sid::new(100, "ok")),
+            Term::Var(o),
+        ))])
+    }
+
+    fn unused_rule_lowering(
+        _source: &str,
+        _snapshot: &LedgerSnapshot,
+    ) -> Result<crate::lang_support::SparqlRuleParts, String> {
+        Err("rules are not lowered here".to_string())
+    }
+
+    /// Flakes served in index order within the requested bounds.
+    struct Flakes(Vec<Flake>);
+
+    impl OverlayProvider for Flakes {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn epoch(&self) -> u64 {
+            1
+        }
+
+        fn for_each_overlay_flake(
+            &self,
+            _g_id: GraphId,
+            index: IndexType,
+            first: Option<&Flake>,
+            rhs: Option<&Flake>,
+            leftmost: bool,
+            to_t: i64,
+            callback: &mut dyn FnMut(&Flake),
+        ) {
+            let mut flakes: Vec<&Flake> = self.0.iter().filter(|f| f.t <= to_t).collect();
+            flakes.sort_by(|a, b| index.compare(a, b));
+            for flake in flakes {
+                let after_first = leftmost
+                    || first.is_none_or(|f| index.compare(flake, f) == std::cmp::Ordering::Greater);
+                let before_rhs =
+                    rhs.is_none_or(|r| index.compare(flake, r) != std::cmp::Ordering::Greater);
+                if after_first && before_rhs {
+                    callback(flake);
+                }
+            }
+        }
+    }
+
+    fn ok(subject: &str) -> Flake {
+        Flake::new(
+            Sid::new(100, subject),
+            Sid::new(100, "ok"),
+            FlakeValue::String("yes".into()),
+            Sid::new(XSD, xsd_names::STRING),
+            1,
+            true,
+            None,
+        )
+    }
+
+    fn this_is(subject: &str) -> HashMap<String, FlakeValue> {
+        HashMap::from([(
+            "?$this".to_string(),
+            FlakeValue::Ref(Sid::new(100, subject)),
+        )])
+    }
+
+    fn sparql() -> PolicyQuery {
+        PolicyQuery {
+            source: "ASK { $this <ok> ?o }".to_string(),
+            language: PolicyQueryLanguage::Sparql,
+            state: ConditionState::Pre,
+        }
+    }
+
+    /// A condition is lowered once per executor and re-seeded per call, so
+    /// the answer must follow each call's bindings rather than the first's,
+    /// and a call binding a different set of names must not be seeded through
+    /// variables prepared for another.
+    #[tokio::test]
+    async fn a_prepared_condition_answers_each_call_for_its_own_bindings() {
+        crate::lang_support::register_sparql_support(crate::lang_support::SparqlSupport {
+            lower_policy_query: lower_this_is_ok,
+            lower_rule: unused_rule_lowering,
+        });
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let overlay = Flakes(vec![ok("alice")]);
+        let executor = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1);
+        let query = sparql();
+
+        let mut answers = Vec::new();
+        for subject in ["alice", "bob", "alice"] {
+            answers.push(
+                executor
+                    .evaluate_policy_query(&query, &this_is(subject))
+                    .await
+                    .expect("evaluate"),
+            );
+        }
+        assert_eq!(
+            answers,
+            [true, false, true],
+            "an answer followed another call's bindings"
+        );
+        assert_eq!(
+            LOWERINGS.load(Ordering::SeqCst),
+            1,
+            "the condition was lowered again for the same names"
+        );
+
+        let mut wider = this_is("bob");
+        wider.insert(
+            "?$identity".to_string(),
+            FlakeValue::Ref(Sid::new(100, "alice")),
+        );
+        assert!(
+            !executor
+                .evaluate_policy_query(&query, &wider)
+                .await
+                .expect("evaluate"),
+            "a call with other names was seeded through the first call's columns"
+        );
+        assert_eq!(LOWERINGS.load(Ordering::SeqCst), 2);
     }
 }
