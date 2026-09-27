@@ -21,6 +21,8 @@ mod it_ledger_info_named_graphs;
 mod it_ledger_lifecycle;
 #[path = "it_merge.rs"]
 mod it_merge;
+#[path = "it_merge_graph_delta_collision.rs"]
+mod it_merge_graph_delta_collision;
 #[path = "it_merge_preview.rs"]
 mod it_merge_preview;
 #[path = "it_profile_ledger.rs"]
@@ -43,5 +45,3 @@ mod it_stable_hashes;
 mod it_sync_graph;
 #[path = "it_sync_graph_rdf.rs"]
 mod it_sync_graph_rdf;
-#[path = "it_merge_graph_delta_collision.rs"]
-mod it_merge_graph_delta_collision;

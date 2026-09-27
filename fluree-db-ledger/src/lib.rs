@@ -759,9 +759,11 @@ impl LedgerState {
 
             // Carry the old graphs forward keeping their ids, so the novelty
             // still keyed by those ids keeps meaning the same thing.
-            let displaced = merged_snapshot
-                .graph_registry
-                .merge_preserving_ids(old_graph_entries.iter().map(|(id, iri)| (*id, iri.as_str())));
+            let displaced = merged_snapshot.graph_registry.merge_preserving_ids(
+                old_graph_entries
+                    .iter()
+                    .map(|(id, iri)| (*id, iri.as_str())),
+            );
             if !displaced.is_empty() {
                 // The root claimed an id this ledger had already given to
                 // something else. Nothing here can reconcile that — say so
