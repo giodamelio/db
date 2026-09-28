@@ -2245,6 +2245,28 @@ impl BinaryIndexStore {
         }
     }
 
+    /// [`Self::find_subject_id_by_parts`] for many subjects, loading each
+    /// dictionary leaf they fall in once rather than once per subject.
+    ///
+    /// A policy judging a batch of flakes looks up every subject's classes, and
+    /// perhaps another predicate's values, by id; one lookup per subject reloaded
+    /// and decoded a leaf each time and was the larger part of that cost.
+    pub fn find_subject_ids_by_parts<'s>(
+        &self,
+        subjects: impl IntoIterator<Item = (u16, &'s str)>,
+    ) -> io::Result<Vec<Option<u64>>> {
+        let keys: Vec<Vec<u8>> = subjects
+            .into_iter()
+            .map(|(ns_code, suffix)| {
+                crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+            })
+            .collect();
+        match &self.dicts.subject_reverse_tree {
+            Some(tree) => tree.reverse_lookup_many(keys.iter().map(Vec::as_slice)),
+            None => Ok(vec![None; keys.len()]),
+        }
+    }
+
     /// Find all subject IDs whose suffix starts with `prefix` within a namespace.
     ///
     /// Uses a range scan on the reverse subject tree: scans the key range

@@ -907,8 +907,15 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     // Translate subjects to s_id and build s_id → Sid map.
     let mut s_ids: Vec<u64> = Vec::with_capacity(subjects.len());
     let mut s_id_to_sid: HashMap<u64, Sid> = HashMap::with_capacity(subjects.len());
-    for sid in subjects {
-        if let Ok(Some(s_id)) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+    let persisted = store
+        .find_subject_ids_by_parts(
+            subjects
+                .iter()
+                .map(|sid| (sid.namespace_code, sid.name.as_ref())),
+        )
+        .unwrap_or_else(|_| vec![None; subjects.len()]);
+    for (sid, persisted) in subjects.iter().zip(persisted) {
+        if let Some(s_id) = persisted {
             s_id_to_sid.entry(s_id).or_insert_with(|| sid.clone());
             s_ids.push(s_id);
         } else if dict_novelty.is_initialized() {
