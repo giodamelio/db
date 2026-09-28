@@ -2,7 +2,7 @@
 //!
 //! Provides the `QueryPolicyEnforcer` which filters flakes by policy with caching.
 
-use super::QueryPolicyExecutor;
+use super::{ConditionCache, QueryPolicyExecutor};
 use crate::error::Result;
 use fluree_db_core::{Flake, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, ClassScope, PolicyContext};
@@ -32,23 +32,22 @@ pub enum PredicateCoverage {
 ///
 /// Wraps a `PolicyContext` and provides async batch filtering for flakes.
 /// Designed to be used by scan operators for per-leaf filtering.
-///
-/// # Caching (TODO)
-///
-/// Future versions will cache f:query results to avoid re-executing
-/// the same policy query for every flake.
 #[derive(Clone)]
 pub struct QueryPolicyEnforcer {
     /// The policy context containing restrictions and identity
     policy: Arc<PolicyContext>,
-    // TODO: Add PolicyQueryCache for memoization
-    // cache: Arc<PolicyQueryCache>,
+    /// What the executors it builds have worked out about their conditions,
+    /// kept for as long as this enforcer is — see [`ConditionCache`].
+    conditions: Arc<ConditionCache>,
 }
 
 impl QueryPolicyEnforcer {
     /// Create a new policy enforcer
     pub fn new(policy: Arc<PolicyContext>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            conditions: Arc::default(),
+        }
     }
 
     /// Get the underlying policy context
@@ -127,20 +126,24 @@ impl QueryPolicyEnforcer {
         }
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
-        let executor =
-            QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
-
         let verdicts = self.static_verdicts(&flakes, tracker);
 
-        let subjects: Vec<Sid> = flakes
+        let mut subjects: Vec<Sid> = flakes
             .iter()
             .zip(&verdicts)
             .filter(|(_, verdict)| verdict.is_none())
             .map(|(flake, _)| flake.s.clone())
             .collect();
+        subjects.sort();
+        subjects.dedup();
         let scope = self
             .resolve_classes(snapshot, g_id, overlay, to_t, &subjects)
             .await?;
+
+        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t)
+            .with_graph_id(g_id)
+            .with_cache(Arc::clone(&self.conditions))
+            .with_subjects(subjects);
 
         let mut result = Vec::with_capacity(flakes.len());
 
@@ -215,8 +218,9 @@ impl QueryPolicyEnforcer {
         }
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
-        let executor =
-            QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
+        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t)
+            .with_graph_id(g_id)
+            .with_cache(Arc::clone(&self.conditions));
 
         let scope = self
             .resolve_classes(

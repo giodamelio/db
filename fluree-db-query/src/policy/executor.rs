@@ -5,15 +5,15 @@
 use crate::binding::Binding;
 use crate::context::ExecutionContext;
 use crate::execute::build_where_operators_seeded;
-use crate::ir::Pattern;
+use crate::ir::{GraphName, Pattern, Ref, Term};
 use crate::var_registry::VarId;
 use crate::var_registry::VarRegistry;
 use fluree_db_core::{
     DatatypeConstraint, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid,
 };
 use fluree_db_policy::{
-    ConditionState, PolicyQuery, PolicyQueryExecutor, PolicyQueryFut, PolicyQueryLanguage,
-    Result as PolicyResult, UNBOUND_IDENTITY_PREFIX,
+    ClassScope, ConditionState, PolicyQuery, PolicyQueryExecutor, PolicyQueryFut,
+    PolicyQueryLanguage, Result as PolicyResult, UNBOUND_IDENTITY_PREFIX,
 };
 use fluree_vocab::namespaces::{EMPTY, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
@@ -46,19 +46,58 @@ pub struct QueryPolicyExecutor<'a> {
     /// the very subjects the transaction is introducing. Falls back to
     /// `snapshot` when absent.
     pub post_snapshot: Option<&'a LedgerSnapshot>,
-    /// SPARQL conditions already lowered against `snapshot`, by source.
+    /// What this executor has already worked out about its conditions.
+    cache: Arc<ConditionCache>,
+    /// The subjects the caller is about to ask about, so that a [`Probe`]
+    /// resolves them in one lookup rather than one per call.
+    subjects: Vec<Sid>,
+}
+
+/// Where a cached answer was read: a ledger at a `t`, and a graph of it.
+type ConditionScope = (ClassScope, GraphId);
+
+/// Each subject's IRI values of one predicate.
+type SubjectRefs = HashMap<Sid, Vec<Sid>>;
+
+/// Rows of a [`Hoisted`] part, by the state read and the row that seeded it.
+type HoistedRows = Vec<(ConditionState, Vec<Binding>, Arc<Vec<Vec<Binding>>>)>;
+
+/// What executors have worked out about their conditions, kept across them.
+///
+/// An executor is built per filter call, and a join probing one subject at a
+/// time makes a filter call per row, so anything kept only as long as an
+/// executor was worked out again for every row. The enforcer holds one of
+/// these for as long as its policy view lives and hands it to each executor
+/// it builds. Every entry is keyed by the ledger, `t` and graph it was read
+/// from, like the class cache, so executors reading different snapshots share
+/// nothing. An executor reading a transaction's staged state keeps a private
+/// one instead, since what is staged is not identified by a `t`.
+#[derive(Default)]
+pub struct ConditionCache {
+    /// SPARQL conditions already lowered, by where and source.
     ///
     /// A condition is asked once per flake it judges, and lowering it was a
     /// quarter of what each ask cost. What lowering produces depends on the
     /// source and on the snapshot IRIs are encoded against — never on the
-    /// bindings, which are seeded afterwards as a VALUES row — so it is done
-    /// once per executor, which is to say once per snapshot.
-    prepared: Mutex<HashMap<String, Arc<PreparedSparql>>>,
+    /// bindings, which are seeded afterwards as a VALUES row.
+    prepared: Mutex<HashMap<(ConditionScope, String), Arc<PreparedSparql>>>,
+    /// Each subject's IRI values of a predicate, by where, whether the
+    /// post-state was read, and the predicate — what a [`Probe`] reads in
+    /// place of running its condition.
+    refs: Mutex<HashMap<(ConditionScope, bool, Sid), SubjectRefs>>,
+}
+
+impl std::fmt::Debug for ConditionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConditionCache").finish_non_exhaustive()
+    }
 }
 
 /// A lowered SPARQL condition and the variables its bindings seed.
 struct PreparedSparql {
     vars: VarRegistry,
+    /// What runs on every call: the whole condition, or what is left of it
+    /// once [`Hoisted`] has been taken out.
     patterns: Vec<Pattern>,
     /// The binding names it was prepared for, sorted. A call with any other
     /// set lowers afresh rather than seeding the wrong variables.
@@ -67,6 +106,174 @@ struct PreparedSparql {
     /// Two names can register as one variable (`?$this` and `?this`); the
     /// first in sorted order fills it, as it did before preparation.
     columns: Vec<(VarId, usize)>,
+    hoisted: Option<Hoisted>,
+    probe: Option<Probe>,
+}
+
+/// A condition whose per-flake part is one triple, `$this <predicate> O`,
+/// answered without running it: it holds when any IRI `$this` has as a
+/// `predicate` value is one `O` allows.
+///
+/// That is what a scoped key comes to once its own projects are hoisted —
+/// `$this ex:project ?p` with `?p` from the key's rows — and it is the same
+/// question the class cache answers for `f:onClass`, so it is answered the same
+/// way: one batched index lookup per filter batch, kept per subject. Running
+/// the condition per flake paid a plan and a scan for each; this pays a hash
+/// lookup. Only IRIs are looked up, which is exact, since `O` only ever allows
+/// IRIs and a literal never equals one.
+struct Probe {
+    predicate: Sid,
+    object: Allowed,
+}
+
+/// What a [`Probe`]'s object may be.
+enum Allowed {
+    /// A row of the hoisted part: its one carried column.
+    Carried,
+    /// A binding that is the same for every flake, such as `$identity`, by its
+    /// index in [`PreparedSparql::names`].
+    Binding(usize),
+    /// A fixed IRI.
+    Iri(Sid),
+}
+
+impl Probe {
+    /// The probe `rest` comes to, or `None` when it is anything but one plain
+    /// triple on `$this` whose object is a variable the hoisted rows or a
+    /// constant binding fill, or an IRI.
+    fn of(
+        rest: &[Pattern],
+        hoisted: Option<&Hoisted>,
+        columns: &[(VarId, usize)],
+        names: &[String],
+    ) -> Option<Probe> {
+        let [Pattern::Triple(triple)] = rest else {
+            return None;
+        };
+        if triple.dtc.is_some() {
+            return None;
+        }
+        let column_of = |var: VarId| columns.iter().find(|(v, _)| *v == var).map(|&(_, n)| n);
+        let this = columns
+            .iter()
+            .find(|&&(_, name)| names[name] == "?$this")
+            .map(|&(var, _)| var)?;
+        if triple.s != Ref::Var(this) {
+            return None;
+        }
+        let Ref::Sid(predicate) = &triple.p else {
+            return None;
+        };
+        let carried = hoisted.map_or(&[][..], |h| h.carried.as_slice());
+        let object = match &triple.o {
+            Term::Var(var) if carried == [*var] => Allowed::Carried,
+            Term::Var(var) if *var != this && carried.is_empty() => {
+                let name = column_of(*var)?;
+                if PER_FLAKE.contains(&names[name].as_str()) {
+                    return None;
+                }
+                Allowed::Binding(name)
+            }
+            Term::Sid(iri) if carried.is_empty() => Allowed::Iri(iri.clone()),
+            _ => return None,
+        };
+        Some(Probe {
+            predicate: predicate.clone(),
+            object,
+        })
+    }
+}
+
+/// The binding names whose values change from one call to the next: the flake
+/// being judged. Every other binding — the identity, the policy values — is
+/// the same for every flake a context judges.
+const PER_FLAKE: [&str; 3] = ["?$this", "?$value", "?$op"];
+
+/// The part of a condition that mentions no per-flake variable, run once and
+/// joined into each call as rows.
+///
+/// A scoped key's `GRAPH <sys> { $identity ex:scopeProject ?p }` answers the
+/// same for every flake, and asking it again per flake was a third of what a
+/// condition cost. Only a plain conjunction is split — triples, `GRAPH` blocks
+/// of triples with a fixed name, and filters, which stay behind — because
+/// there joining a part's rows back in is the same as running it in place.
+/// `OPTIONAL`, `MINUS`, `UNION`, `BIND` and the rest depend on what is joined
+/// before them, so a condition holding any of them is not split at all.
+struct Hoisted {
+    patterns: Vec<Pattern>,
+    /// The columns seeding it: those of [`PreparedSparql::columns`] that are
+    /// not per-flake.
+    columns: Vec<(VarId, usize)>,
+    /// What it binds that the rest reads.
+    carried: Vec<VarId>,
+    /// Rows already computed, by the state read and the seeding row.
+    rows: Mutex<HoistedRows>,
+}
+
+impl Hoisted {
+    /// Split `patterns` into the part to hoist and the rest, or `None` when
+    /// the condition is not a plain conjunction or nothing in it can move.
+    fn split(
+        patterns: Vec<Pattern>,
+        columns: &[(VarId, usize)],
+        names: &[String],
+    ) -> (Vec<Pattern>, Option<Hoisted>) {
+        let per_flake: Vec<VarId> = columns
+            .iter()
+            .filter(|&&(_, name)| PER_FLAKE.contains(&names[name].as_str()))
+            .map(|&(var, _)| var)
+            .collect();
+        let constant: Vec<(VarId, usize)> = columns
+            .iter()
+            .filter(|(var, _)| !per_flake.contains(var))
+            .copied()
+            .collect();
+
+        let is_block = |pattern: &Pattern| match pattern {
+            Pattern::Triple(_) => true,
+            Pattern::Graph {
+                name: GraphName::Iri(_),
+                patterns,
+            } => patterns.iter().all(|p| matches!(p, Pattern::Triple(_))),
+            _ => false,
+        };
+        if !patterns
+            .iter()
+            .all(|p| is_block(p) || matches!(p, Pattern::Filter(_)))
+        {
+            return (patterns, None);
+        }
+        let (hoisted, rest): (Vec<Pattern>, Vec<Pattern>) =
+            patterns.into_iter().partition(|pattern| {
+                is_block(pattern)
+                    && pattern
+                        .referenced_vars()
+                        .iter()
+                        .all(|var| !per_flake.contains(var))
+            });
+        if hoisted.is_empty() {
+            return (rest, None);
+        }
+
+        let read: Vec<VarId> = rest.iter().flat_map(Pattern::referenced_vars).collect();
+        let mut carried: Vec<VarId> = hoisted
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .filter(|var| read.contains(var) && !constant.iter().any(|(c, _)| c == var))
+            .collect();
+        carried.sort();
+        carried.dedup();
+
+        (
+            rest,
+            Some(Hoisted {
+                patterns: hoisted,
+                columns: constant,
+                carried,
+                rows: Mutex::default(),
+            }),
+        )
+    }
 }
 
 impl<'a> QueryPolicyExecutor<'a> {
@@ -80,7 +287,8 @@ impl<'a> QueryPolicyExecutor<'a> {
             post_overlay: None,
             post_to_t: snapshot.t,
             post_snapshot: None,
-            prepared: Mutex::default(),
+            cache: Arc::default(),
+            subjects: Vec::new(),
         }
     }
 
@@ -98,7 +306,8 @@ impl<'a> QueryPolicyExecutor<'a> {
             post_overlay: None,
             post_to_t: to_t,
             post_snapshot: None,
-            prepared: Mutex::default(),
+            cache: Arc::default(),
+            subjects: Vec::new(),
         }
     }
 
@@ -112,9 +321,23 @@ impl<'a> QueryPolicyExecutor<'a> {
 
     /// Attach a post-state overlay (committed + staged flakes) for
     /// `f:queryState f:postState` conditions, with the staged t.
+    ///
+    /// The executor keeps its own [`ConditionCache`] from then on, whatever
+    /// [`Self::with_cache`] handed it: staged flakes are not identified by a
+    /// `t`, so nothing read through them may be shared.
     pub fn with_post_state(mut self, overlay: &'a dyn OverlayProvider, to_t: i64) -> Self {
         self.post_overlay = Some(overlay);
         self.post_to_t = to_t;
+        self.cache = Arc::default();
+        self
+    }
+
+    /// Keep what this executor works out in `cache`, and use what is already
+    /// there. Ignored for an executor reading a staged post-state.
+    pub fn with_cache(mut self, cache: Arc<ConditionCache>) -> Self {
+        if self.post_overlay.is_none() {
+            self.cache = cache;
+        }
         self
     }
 
@@ -123,6 +346,13 @@ impl<'a> QueryPolicyExecutor<'a> {
     /// flakes).
     pub fn with_post_state_snapshot(mut self, snapshot: &'a LedgerSnapshot) -> Self {
         self.post_snapshot = Some(snapshot);
+        self
+    }
+
+    /// Name the subjects this executor is about to be asked about, so a
+    /// condition answered by index lookup resolves them all in one.
+    pub fn with_subjects(mut self, subjects: Vec<Sid>) -> Self {
+        self.subjects = subjects;
         self
     }
 }
@@ -234,7 +464,7 @@ fn default_literal_datatype(value: &FlakeValue) -> Option<Sid> {
     Some(Sid::new(XSD, name))
 }
 
-impl QueryPolicyExecutor<'_> {
+impl<'a> QueryPolicyExecutor<'a> {
     /// Async implementation of policy query evaluation
     async fn evaluate_async(
         &self,
@@ -497,22 +727,135 @@ impl QueryPolicyExecutor<'_> {
         names.sort();
         let prepared = self.prepared_sparql(source, &names)?;
 
+        let row_of = |columns: &[(VarId, usize)]| -> Vec<Binding> {
+            columns
+                .iter()
+                .map(|&(_, name)| binding_for_value(&bindings[names[name]]))
+                .collect()
+        };
+
+        let hoisted_rows = match &prepared.hoisted {
+            Some(hoisted) => {
+                let rows = self
+                    .hoisted_rows(&prepared.vars, hoisted, row_of(&hoisted.columns), state)
+                    .await?;
+                if rows.is_empty() {
+                    return Ok(false);
+                }
+                Some(rows)
+            }
+            None => None,
+        };
+
+        if let (Some(probe), Some(FlakeValue::Ref(subject))) =
+            (&prepared.probe, bindings.get("?$this"))
+        {
+            let refs = self.subject_refs(state, &probe.predicate, subject).await?;
+            let allowed = |iri: &Sid| match &probe.object {
+                Allowed::Carried => hoisted_rows.as_deref().is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| matches!(&row[0], Binding::Sid { sid, .. } if sid == iri))
+                }),
+                Allowed::Binding(name) => {
+                    matches!(&bindings[names[*name]], FlakeValue::Ref(sid) if sid == iri)
+                }
+                Allowed::Iri(sid) => sid == iri,
+            };
+            return Ok(refs.iter().any(allowed));
+        }
+
         // Seed special variables with a VALUES pattern, mirroring the JSON-LD
         // path's injected VALUES clause.
-        let row = prepared
-            .columns
-            .iter()
-            .map(|&(_, name)| binding_for_value(&bindings[names[name]]))
-            .collect();
-        let mut patterns = Vec::with_capacity(prepared.patterns.len() + 1);
+        let mut patterns = Vec::with_capacity(prepared.patterns.len() + 2);
         patterns.push(Pattern::Values {
             vars: prepared.columns.iter().map(|&(var, _)| var).collect(),
-            rows: vec![row],
+            rows: vec![row_of(&prepared.columns)],
         });
+        if let (Some(hoisted), Some(rows)) = (&prepared.hoisted, &hoisted_rows) {
+            if !hoisted.carried.is_empty() {
+                patterns.push(Pattern::Values {
+                    vars: hoisted.carried.clone(),
+                    rows: rows.to_vec(),
+                });
+            }
+        }
         patterns.extend(prepared.patterns.iter().cloned());
 
         self.run_existence_check(&prepared.vars, &patterns, state)
             .await
+    }
+
+    /// Every row of `hoisted` for this seeding, projected to what the rest of
+    /// the condition reads — computed on the first call that seeds it this way
+    /// and kept for the executor's life.
+    async fn hoisted_rows(
+        &self,
+        vars: &VarRegistry,
+        hoisted: &Hoisted,
+        seed: Vec<Binding>,
+        state: ConditionState,
+    ) -> PolicyResult<Arc<Vec<Vec<Binding>>>> {
+        let poisoned = || fluree_db_policy::PolicyError::QueryExecution {
+            message: "hoisted condition cache lock poisoned".to_string(),
+        };
+        let cached = hoisted
+            .rows
+            .lock()
+            .map_err(|_| poisoned())?
+            .iter()
+            .find(|(s, row, _)| *s == state && *row == seed)
+            .map(|(_, _, rows)| Arc::clone(rows));
+        if let Some(rows) = cached {
+            return Ok(rows);
+        }
+
+        let mut patterns = Vec::with_capacity(hoisted.patterns.len() + 1);
+        patterns.push(Pattern::Values {
+            vars: hoisted.columns.iter().map(|&(var, _)| var).collect(),
+            rows: vec![seed.clone()],
+        });
+        patterns.extend(hoisted.patterns.iter().cloned());
+
+        // Eager, so that what is joined back in is a `Sid` or `Lit` and
+        // compares like the rest of the condition's own bindings.
+        let mut ctx = self.context(vars, state);
+        ctx.eager_materialization = true;
+        let mut operator = self.plan(&patterns)?;
+        let query_error =
+            |e: crate::error::QueryError| fluree_db_policy::PolicyError::QueryExecution {
+                message: e.to_string(),
+            };
+        operator.open(&ctx).await.map_err(query_error)?;
+        let mut rows: Vec<Vec<Binding>> = Vec::new();
+        loop {
+            let batch = match operator.next_batch(&ctx).await {
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
+                Err(e) => {
+                    operator.close();
+                    return Err(query_error(e));
+                }
+            };
+            for index in 0..batch.len() {
+                let row: Vec<Binding> = hoisted
+                    .carried
+                    .iter()
+                    .map(|&var| batch.get(index, var).cloned().unwrap_or(Binding::Unbound))
+                    .collect();
+                if !rows.contains(&row) {
+                    rows.push(row);
+                }
+            }
+        }
+        operator.close();
+
+        let rows = Arc::new(rows);
+        hoisted
+            .rows
+            .lock()
+            .map_err(|_| poisoned())?
+            .push((state, seed, Arc::clone(&rows)));
+        Ok(rows)
     }
 
     /// `source` lowered against this executor's snapshot, with the variables
@@ -523,13 +866,15 @@ impl QueryPolicyExecutor<'_> {
         source: &str,
         names: &[&String],
     ) -> PolicyResult<Arc<PreparedSparql>> {
+        let key = (self.scope(), source.to_string());
         let cached = self
+            .cache
             .prepared
             .lock()
             .map_err(|_| fluree_db_policy::PolicyError::QueryExecution {
                 message: "SPARQL condition cache lock poisoned".to_string(),
             })?
-            .get(source)
+            .get(&key)
             .cloned();
         if let Some(prepared) = cached.filter(|p| p.names.iter().eq(names.iter().copied())) {
             return Ok(prepared);
@@ -561,19 +906,34 @@ impl QueryPolicyExecutor<'_> {
             }
         }
 
+        let names: Vec<String> = names.iter().map(|name| (*name).clone()).collect();
+        let (patterns, hoisted) = Hoisted::split(patterns, &columns, &names);
+        let probe = Probe::of(&patterns, hoisted.as_ref(), &columns, &names);
         let prepared = Arc::new(PreparedSparql {
             vars,
             patterns,
-            names: names.iter().map(|name| (*name).clone()).collect(),
+            names,
             columns,
+            hoisted,
+            probe,
         });
-        self.prepared
+        self.cache
+            .prepared
             .lock()
             .map_err(|_| fluree_db_policy::PolicyError::QueryExecution {
                 message: "SPARQL condition cache lock poisoned".to_string(),
             })?
-            .insert(source.to_string(), Arc::clone(&prepared));
+            .insert(key, Arc::clone(&prepared));
         Ok(prepared)
+    }
+
+    /// The snapshot and graph this executor reads, as its cache entries are
+    /// keyed.
+    fn scope(&self) -> ConditionScope {
+        (
+            ClassScope::new(&self.snapshot.ledger_id, self.to_t),
+            self.g_id,
+        )
     }
 
     /// Execute WHERE patterns with a root (policy-free) context and report
@@ -584,45 +944,8 @@ impl QueryPolicyExecutor<'_> {
         patterns: &[Pattern],
         state: ConditionState,
     ) -> PolicyResult<bool> {
-        // Per-condition state selection: `f:postState` reads through the
-        // staged overlay when one is attached; otherwise (read paths, no
-        // transaction in flight) pre and post coincide with current state.
-        let (snapshot, overlay, to_t) = match state {
-            ConditionState::Post => match self.post_overlay {
-                Some(post) => (
-                    self.post_snapshot.unwrap_or(self.snapshot),
-                    Some(post),
-                    self.post_to_t,
-                ),
-                None => (self.snapshot, self.overlay, self.to_t),
-            },
-            ConditionState::Pre => (self.snapshot, self.overlay, self.to_t),
-        };
-
-        // Create the execution context WITHOUT policy (root context)
-        // This is critical - policy queries must not be filtered by policy
-        let ctx = if let Some(overlay) = overlay {
-            ExecutionContext::with_time_and_overlay(snapshot, vars, to_t, None, overlay)
-                .with_graph_id(self.g_id)
-        } else {
-            ExecutionContext::with_time(snapshot, vars, to_t, None).with_graph_id(self.g_id)
-        };
-
-        // Build the where clause operators (VALUES is now part of the patterns).
-        //
-        // Root: policy queries always evaluate at the selected state's t for
-        // current state — they're access-control predicates, not
-        // history-range queries. Always plan as `Current`.
-        let mut operator = build_where_operators_seeded(
-            None,
-            patterns,
-            None,
-            None,
-            &crate::temporal_mode::PlanningContext::current(),
-        )
-        .map_err(|e| fluree_db_policy::PolicyError::QueryExecution {
-            message: e.to_string(),
-        })?;
+        let ctx = self.context(vars, state);
+        let mut operator = self.plan(patterns)?;
 
         // Execute and check if there's at least one result (existence check)
         operator
@@ -646,6 +969,114 @@ impl QueryPolicyExecutor<'_> {
         operator.close();
 
         Ok(has_results)
+    }
+
+    /// A root (policy-free) context reading the state a condition asks for.
+    fn context<'c>(&'c self, vars: &'c VarRegistry, state: ConditionState) -> ExecutionContext<'c> {
+        let (snapshot, overlay, to_t) = self.state_view(state);
+
+        // Create the execution context WITHOUT policy (root context)
+        // This is critical - policy queries must not be filtered by policy
+        if let Some(overlay) = overlay {
+            ExecutionContext::with_time_and_overlay(snapshot, vars, to_t, None, overlay)
+                .with_graph_id(self.g_id)
+        } else {
+            ExecutionContext::with_time(snapshot, vars, to_t, None).with_graph_id(self.g_id)
+        }
+    }
+
+    /// The snapshot, overlay and `t` a condition reads.
+    ///
+    /// Per-condition state selection: `f:postState` reads through the staged
+    /// overlay when one is attached; otherwise (read paths, no transaction in
+    /// flight) pre and post coincide with current state.
+    fn state_view(
+        &self,
+        state: ConditionState,
+    ) -> (&'a LedgerSnapshot, Option<&'a dyn OverlayProvider>, i64) {
+        match state {
+            ConditionState::Post => match self.post_overlay {
+                Some(post) => (
+                    self.post_snapshot.unwrap_or(self.snapshot),
+                    Some(post),
+                    self.post_to_t,
+                ),
+                None => (self.snapshot, self.overlay, self.to_t),
+            },
+            ConditionState::Pre => (self.snapshot, self.overlay, self.to_t),
+        }
+    }
+
+    /// The IRIs `subject` has as `predicate` values in the state read. On a
+    /// miss every subject named by [`Self::with_subjects`] that is not yet
+    /// known is resolved with it, in one lookup.
+    async fn subject_refs(
+        &self,
+        state: ConditionState,
+        predicate: &Sid,
+        subject: &Sid,
+    ) -> PolicyResult<Vec<Sid>> {
+        let poisoned = || fluree_db_policy::PolicyError::QueryExecution {
+            message: "condition lookup cache lock poisoned".to_string(),
+        };
+        let key = (
+            self.scope(),
+            state == ConditionState::Post,
+            predicate.clone(),
+        );
+        let missing: Vec<Sid> = {
+            let refs = self.cache.refs.lock().map_err(|_| poisoned())?;
+            let known = refs.get(&key);
+            if let Some(found) = known.and_then(|known| known.get(subject)) {
+                return Ok(found.clone());
+            }
+            let mut missing: Vec<Sid> = self
+                .subjects
+                .iter()
+                .chain(std::iter::once(subject))
+                .filter(|s| known.is_none_or(|known| !known.contains_key(*s)))
+                .cloned()
+                .collect();
+            missing.sort();
+            missing.dedup();
+            missing
+        };
+
+        let (snapshot, overlay, to_t) = self.state_view(state);
+        let no_overlay = fluree_db_core::NoOverlay;
+        let db = fluree_db_core::GraphDbRef::new(
+            snapshot,
+            self.g_id,
+            overlay.unwrap_or(&no_overlay),
+            to_t,
+        );
+        let mut found = fluree_db_policy::lookup_subject_refs(&missing, predicate, db).await?;
+
+        let mut refs = self.cache.refs.lock().map_err(|_| poisoned())?;
+        let known = refs.entry(key).or_default();
+        for s in missing {
+            let values = found.remove(&s).unwrap_or_default();
+            known.insert(s, values);
+        }
+        Ok(known.get(subject).cloned().unwrap_or_default())
+    }
+
+    /// Build the where clause operators (VALUES is part of the patterns).
+    ///
+    /// Root: policy queries always evaluate at the selected state's t for
+    /// current state — they're access-control predicates, not history-range
+    /// queries. Always plan as `Current`.
+    fn plan(&self, patterns: &[Pattern]) -> PolicyResult<crate::operator::BoxedOperator> {
+        build_where_operators_seeded(
+            None,
+            patterns,
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        )
+        .map_err(|e| fluree_db_policy::PolicyError::QueryExecution {
+            message: e.to_string(),
+        })
     }
 }
 
@@ -715,21 +1146,72 @@ mod tests {
 
     static LOWERINGS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Stands in for the SPARQL layer: `ASK { $this <ok> ?o }`, whatever the
-    /// source says, counting how often it is asked to lower.
-    fn lower_this_is_ok(
-        _source: &str,
+    fn triple(s: Ref, p: &str, o: Term) -> Pattern {
+        Pattern::Triple(TriplePattern::new(s, Ref::Sid(Sid::new(100, p)), o))
+    }
+
+    /// Stands in for the SPARQL layer, counting how often it is asked to lower.
+    /// The source names which of these the condition is:
+    ///
+    /// - `this-ok`: `$this <ok> ?o`
+    /// - `scoped`: `$identity <scope> ?p . $this <project> ?p` — a scoped key
+    /// - `owner`: `$this <owner> $identity`
+    /// - `fixed`: `$this <project> <p1>`
+    ///
+    /// Any of the last three with `-whole` appended gains an
+    /// `OPTIONAL { $this <note> ?n }`. That changes no answer, and makes the
+    /// condition something other than a plain conjunction, so it runs whole —
+    /// the engine's own answer to compare the split and probed ones against.
+    fn lower_stub(
+        source: &str,
         _snapshot: &LedgerSnapshot,
         vars: &mut VarRegistry,
     ) -> Result<Vec<Pattern>, String> {
         LOWERINGS.fetch_add(1, Ordering::SeqCst);
-        let this = vars.get_or_insert("?this");
-        let o = vars.get_or_insert("?o");
-        Ok(vec![Pattern::Triple(TriplePattern::new(
-            Ref::Var(this),
-            Ref::Sid(Sid::new(100, "ok")),
-            Term::Var(o),
-        ))])
+        let this = Ref::Var(vars.get_or_insert("?this"));
+        match source {
+            "this-ok" => Ok(vec![triple(
+                this,
+                "ok",
+                Term::Var(vars.get_or_insert("?o")),
+            )]),
+            shape => {
+                let (shape, whole) = match shape.strip_suffix("-whole") {
+                    Some(shape) => (shape, true),
+                    None => (shape, false),
+                };
+                let identity = Ref::Var(vars.get_or_insert("?identity"));
+                let mut patterns = match shape {
+                    "scoped" => {
+                        let p = vars.get_or_insert("?p");
+                        vec![
+                            triple(identity, "scope", Term::Var(p)),
+                            triple(this.clone(), "project", Term::Var(p)),
+                        ]
+                    }
+                    "owner" => {
+                        let Ref::Var(identity) = identity else {
+                            unreachable!()
+                        };
+                        vec![triple(this.clone(), "owner", Term::Var(identity))]
+                    }
+                    "fixed" => vec![triple(
+                        this.clone(),
+                        "project",
+                        Term::Sid(Sid::new(100, "p1")),
+                    )],
+                    other => return Err(format!("no stub for {other}")),
+                };
+                if whole {
+                    patterns.push(Pattern::Optional(vec![triple(
+                        this,
+                        "note",
+                        Term::Var(vars.get_or_insert("?n")),
+                    )]));
+                }
+                Ok(patterns)
+            }
+        }
     }
 
     fn unused_rule_lowering(
@@ -787,6 +1269,22 @@ mod tests {
         )
     }
 
+    fn link(subject: &str, predicate: &str, object: &str) -> Flake {
+        link_at(subject, predicate, object, 1)
+    }
+
+    fn link_at(subject: &str, predicate: &str, object: &str, t: i64) -> Flake {
+        Flake::new(
+            Sid::new(100, subject),
+            Sid::new(100, predicate),
+            FlakeValue::Ref(Sid::new(100, object)),
+            Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+            t,
+            true,
+            None,
+        )
+    }
+
     fn this_is(subject: &str) -> HashMap<String, FlakeValue> {
         HashMap::from([(
             "?$this".to_string(),
@@ -794,12 +1292,145 @@ mod tests {
         )])
     }
 
-    fn sparql() -> PolicyQuery {
+    /// The bindings a read-side call carries: every special variable, as
+    /// `build_policy_values_clause` builds them.
+    fn judging(identity: &str, subject: &str) -> HashMap<String, FlakeValue> {
+        HashMap::from([
+            (
+                "?$this".to_string(),
+                FlakeValue::Ref(Sid::new(100, subject)),
+            ),
+            (
+                "?$identity".to_string(),
+                FlakeValue::Ref(Sid::new(100, identity)),
+            ),
+            ("?$value".to_string(), FlakeValue::String("v".into())),
+            ("?$op".to_string(), FlakeValue::String("assert".into())),
+        ])
+    }
+
+    async fn ask(
+        executor: &QueryPolicyExecutor<'_>,
+        query: &PolicyQuery,
+        identity: &str,
+        todo: &str,
+    ) -> bool {
+        executor
+            .evaluate_policy_query(query, &judging(identity, todo))
+            .await
+            .expect("evaluate")
+    }
+
+    fn condition(source: &str) -> PolicyQuery {
         PolicyQuery {
-            source: "ASK { $this <ok> ?o }".to_string(),
+            source: source.to_string(),
             language: PolicyQueryLanguage::Sparql,
             state: ConditionState::Pre,
         }
+    }
+
+    fn register_stub() {
+        crate::lang_support::register_sparql_support(crate::lang_support::SparqlSupport {
+            lower_policy_query: lower_stub,
+            lower_rule: unused_rule_lowering,
+        });
+    }
+
+    /// Two keys over four todos. `alice` is scoped to `p1` and `p2`, `carol`
+    /// to `p3`, `bob` to nothing; `t3` is in two projects and `t4` in none,
+    /// though it carries the literal `"p1"` as a project, which no IRI equals.
+    /// `t1` is owned by `alice`, `t2` by `carol`, `t4` by `bob`.
+    fn scoped_ledger() -> Flakes {
+        Flakes(vec![
+            link("alice", "scope", "p1"),
+            link("alice", "scope", "p2"),
+            link("carol", "scope", "p3"),
+            link("t1", "project", "p1"),
+            link("t2", "project", "p3"),
+            link("t3", "project", "p2"),
+            link("t3", "project", "p3"),
+            Flake::new(
+                Sid::new(100, "t4"),
+                Sid::new(100, "project"),
+                FlakeValue::String("p1".into()),
+                Sid::new(XSD, xsd_names::STRING),
+                1,
+                true,
+                None,
+            ),
+            link("t3", "note", "n1"),
+            link("t1", "owner", "alice"),
+            link("t2", "owner", "carol"),
+            link("t4", "owner", "bob"),
+        ])
+    }
+
+    /// Counts the overlay reads made through it — how many times the ledger
+    /// was consulted, since these tests have no index.
+    struct Counted<'o> {
+        inner: &'o Flakes,
+        reads: AtomicUsize,
+    }
+
+    impl OverlayProvider for Counted<'_> {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+
+        fn epoch(&self) -> u64 {
+            self.inner.epoch()
+        }
+
+        fn for_each_overlay_flake(
+            &self,
+            g_id: GraphId,
+            index: IndexType,
+            first: Option<&Flake>,
+            rhs: Option<&Flake>,
+            leftmost: bool,
+            to_t: i64,
+            callback: &mut dyn FnMut(&Flake),
+        ) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, callback);
+        }
+    }
+
+    /// What each key may see, asked of one executor in an order that changes
+    /// key between calls, so a result kept for one identity answering for
+    /// another shows up as a wrong row.
+    async fn visible(source: &str) -> Vec<(&'static str, &'static str, bool)> {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let overlay = scoped_ledger();
+        let executor = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+            .with_subjects(["t1", "t2", "t3", "t4"].map(|t| Sid::new(100, t)).to_vec());
+        let query = condition(source);
+        let mut seen = Vec::new();
+        for identity in ["alice", "bob", "carol", "alice"] {
+            for todo in ["t1", "t2", "t3", "t4"] {
+                let allowed = executor
+                    .evaluate_policy_query(&query, &judging(identity, todo))
+                    .await
+                    .expect("evaluate");
+                seen.push((identity, todo, allowed));
+            }
+        }
+        seen
+    }
+
+    fn expected_visibility() -> Vec<(&'static str, &'static str, bool)> {
+        let mut rows = Vec::new();
+        for identity in ["alice", "bob", "carol", "alice"] {
+            for todo in ["t1", "t2", "t3", "t4"] {
+                let allowed = matches!(
+                    (identity, todo),
+                    ("alice", "t1" | "t3") | ("carol", "t2" | "t3")
+                );
+                rows.push((identity, todo, allowed));
+            }
+        }
+        rows
     }
 
     /// A condition is lowered once per executor and re-seeded per call, so
@@ -808,14 +1439,11 @@ mod tests {
     /// variables prepared for another.
     #[tokio::test]
     async fn a_prepared_condition_answers_each_call_for_its_own_bindings() {
-        crate::lang_support::register_sparql_support(crate::lang_support::SparqlSupport {
-            lower_policy_query: lower_this_is_ok,
-            lower_rule: unused_rule_lowering,
-        });
+        register_stub();
         let snapshot = LedgerSnapshot::genesis("test:main");
         let overlay = Flakes(vec![ok("alice")]);
         let executor = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1);
-        let query = sparql();
+        let query = condition("this-ok");
 
         let mut answers = Vec::new();
         for subject in ["alice", "bob", "alice"] {
@@ -850,5 +1478,246 @@ mod tests {
             "a call with other names was seeded through the first call's columns"
         );
         assert_eq!(LOWERINGS.load(Ordering::SeqCst), 2);
+    }
+
+    /// A scoped key's condition is split: the key's own projects are looked up
+    /// once and joined into each call. The answers must be the ones running it
+    /// whole would give — for every key, including one scoped to nothing, and
+    /// with the key changing between calls on one executor.
+    #[tokio::test]
+    async fn a_hoisted_condition_answers_as_the_whole_one_would() {
+        register_stub();
+        assert_eq!(visible("scoped").await, expected_visibility());
+    }
+
+    /// The control: an `OPTIONAL` makes the condition something other than a
+    /// plain conjunction, so it runs whole, and must still give the same
+    /// answers.
+    #[tokio::test]
+    async fn a_condition_that_is_not_a_plain_conjunction_runs_whole() {
+        register_stub();
+        assert_eq!(visible("scoped-whole").await, expected_visibility());
+    }
+
+    /// Each shape a probe answers — an object from the hoisted rows, from a
+    /// binding, or fixed — against the engine running the same condition
+    /// whole. The data holds a subject in two projects, one in none, and a
+    /// literal where an IRI is looked for.
+    #[tokio::test]
+    async fn a_probe_answers_as_running_the_condition_would() {
+        register_stub();
+        for shape in ["scoped", "owner", "fixed"] {
+            let probed = visible(shape).await;
+            assert!(
+                probed.iter().any(|row| row.2) && probed.iter().any(|row| !row.2),
+                "{shape}: the data does not tell answers apart"
+            );
+            assert_eq!(
+                probed,
+                visible(&format!("{shape}-whole")).await,
+                "{shape}: the probe disagreed with the condition run whole"
+            );
+        }
+    }
+
+    /// A probe resolves every subject it was told about on its first miss, so
+    /// the rest of the batch is answered without consulting the ledger. A
+    /// subject it was not told about is still answered, on its own.
+    #[tokio::test]
+    async fn a_probe_resolves_its_batch_in_one_pass() {
+        register_stub();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let ledger = scoped_ledger();
+        let overlay = Counted {
+            inner: &ledger,
+            reads: AtomicUsize::new(0),
+        };
+        let executor = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+            .with_subjects(["t1", "t2", "t3", "t4"].map(|t| Sid::new(100, t)).to_vec());
+        let query = condition("owner");
+
+        assert!(ask(&executor, &query, "alice", "t1").await);
+        let after_first = overlay.reads.load(Ordering::SeqCst);
+        for todo in ["t2", "t3", "t4"] {
+            assert!(!ask(&executor, &query, "alice", todo).await);
+        }
+        assert_eq!(
+            overlay.reads.load(Ordering::SeqCst),
+            after_first,
+            "the rest of the batch consulted the ledger again"
+        );
+
+        assert!(!ask(&executor, &query, "alice", "t9").await);
+        assert!(
+            overlay.reads.load(Ordering::SeqCst) > after_first,
+            "a subject outside the batch was answered without being looked up"
+        );
+    }
+
+    /// Which conditions are answered by probe. Each shape the probe knows is;
+    /// a `$this` triple whose object nothing constrains is not, nor is
+    /// anything that runs whole.
+    #[test]
+    fn only_a_single_constrained_triple_on_this_becomes_a_probe() {
+        let mut names: Vec<String> = judging("alice", "t1").into_keys().collect();
+        names.sort();
+        let probe = |source: &str| {
+            let mut vars = VarRegistry::new();
+            let patterns =
+                lower_stub(source, &LedgerSnapshot::genesis("test:main"), &mut vars).unwrap();
+            let columns: Vec<(VarId, usize)> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (vars.get_or_insert(&sparql_var_name(name)), index))
+                .collect();
+            let (rest, hoisted) = Hoisted::split(patterns, &columns, &names);
+            Probe::of(&rest, hoisted.as_ref(), &columns, &names).map(|probe| probe.object)
+        };
+
+        assert!(matches!(probe("scoped"), Some(Allowed::Carried)));
+        assert!(matches!(probe("owner"), Some(Allowed::Binding(_))));
+        assert!(matches!(probe("fixed"), Some(Allowed::Iri(_))));
+        assert!(
+            probe("this-ok").is_none(),
+            "an unconstrained object was probed"
+        );
+        assert!(
+            probe("scoped-whole").is_none(),
+            "a whole condition was probed"
+        );
+    }
+
+    /// Which conditions are split, and into what. The scoped key's own lookup
+    /// moves and carries `?p`; nothing moves out of a condition holding an
+    /// `OPTIONAL`, or out of one whose every triple mentions `$this`.
+    #[test]
+    fn only_the_identity_side_of_a_plain_conjunction_is_hoisted() {
+        let mut names: Vec<String> = judging("alice", "t1").into_keys().collect();
+        names.sort();
+        let split = |source: &str| {
+            let mut vars = VarRegistry::new();
+            let patterns =
+                lower_stub(source, &LedgerSnapshot::genesis("test:main"), &mut vars).unwrap();
+            let columns: Vec<(VarId, usize)> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (vars.get_or_insert(&sparql_var_name(name)), index))
+                .collect();
+            let (rest, hoisted) = Hoisted::split(patterns, &columns, &names);
+            (vars, rest, hoisted)
+        };
+
+        let (vars, rest, hoisted) = split("scoped");
+        let hoisted = hoisted.expect("the scoped key's lookup is hoisted");
+        assert_eq!(hoisted.patterns.len(), 1);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(hoisted.carried, vec![vars.get("?p").unwrap()]);
+
+        let (_, rest, hoisted) = split("scoped-whole");
+        assert!(hoisted.is_none(), "a condition with an OPTIONAL was split");
+        assert_eq!(rest.len(), 3);
+
+        let (_, rest, hoisted) = split("this-ok");
+        assert!(hoisted.is_none(), "a triple on $this was hoisted");
+        assert_eq!(rest.len(), 1);
+    }
+
+    /// A join probes one subject at a time, and the enforcer builds an
+    /// executor per probe. Executors given the same cache must work a
+    /// condition out once between them: a subject the first resolved is
+    /// answered by the second without reading the ledger.
+    #[tokio::test]
+    async fn executors_sharing_a_cache_work_a_condition_out_once() {
+        register_stub();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let ledger = scoped_ledger();
+        let overlay = Counted {
+            inner: &ledger,
+            reads: AtomicUsize::new(0),
+        };
+        let cache = Arc::new(ConditionCache::default());
+        let query = condition("scoped");
+
+        let first = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+            .with_cache(Arc::clone(&cache))
+            .with_subjects(vec![Sid::new(100, "t1"), Sid::new(100, "t2")]);
+        assert!(ask(&first, &query, "alice", "t1").await);
+        let lowered = LOWERINGS.load(Ordering::SeqCst);
+        let read = overlay.reads.load(Ordering::SeqCst);
+
+        let second = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+            .with_cache(Arc::clone(&cache))
+            .with_subjects(vec![Sid::new(100, "t2")]);
+        assert!(!ask(&second, &query, "alice", "t2").await);
+        assert_eq!(
+            LOWERINGS.load(Ordering::SeqCst),
+            lowered,
+            "the second executor lowered the condition again"
+        );
+        assert_eq!(
+            overlay.reads.load(Ordering::SeqCst),
+            read,
+            "the second executor read the ledger for what the first resolved"
+        );
+    }
+
+    /// A cache entry says what was true at a `t`. `t2` passes to `alice` at
+    /// `t = 2`, so an executor reading `t = 2` through a cache filled at
+    /// `t = 1` must see her own it.
+    #[tokio::test]
+    async fn a_cached_answer_does_not_answer_for_another_t() {
+        register_stub();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut ledger = scoped_ledger();
+        ledger.0.push(link_at("t2", "owner", "alice", 2));
+        let cache = Arc::new(ConditionCache::default());
+        let query = condition("owner");
+
+        let before =
+            QueryPolicyExecutor::with_overlay(&snapshot, &ledger, 1).with_cache(Arc::clone(&cache));
+        assert!(!ask(&before, &query, "alice", "t2").await);
+
+        let after =
+            QueryPolicyExecutor::with_overlay(&snapshot, &ledger, 2).with_cache(Arc::clone(&cache));
+        assert!(
+            ask(&after, &query, "alice", "t2").await,
+            "an answer cached at t = 1 answered for t = 2"
+        );
+    }
+
+    /// Staged flakes are not identified by a `t`, so an executor reading a
+    /// transaction's post-state keeps its own cache even when handed one —
+    /// in either order.
+    #[tokio::test]
+    async fn an_executor_reading_staged_state_shares_no_cache() {
+        register_stub();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let ledger = scoped_ledger();
+        let overlay = Counted {
+            inner: &ledger,
+            reads: AtomicUsize::new(0),
+        };
+        let cache = Arc::new(ConditionCache::default());
+        let query = condition("owner");
+
+        let shared = QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+            .with_cache(Arc::clone(&cache));
+        assert!(ask(&shared, &query, "alice", "t1").await);
+
+        for staged in [
+            QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+                .with_post_state(&ledger, 1)
+                .with_cache(Arc::clone(&cache)),
+            QueryPolicyExecutor::with_overlay(&snapshot, &overlay, 1)
+                .with_cache(Arc::clone(&cache))
+                .with_post_state(&ledger, 1),
+        ] {
+            let read = overlay.reads.load(Ordering::SeqCst);
+            assert!(ask(&staged, &query, "alice", "t1").await);
+            assert!(
+                overlay.reads.load(Ordering::SeqCst) > read,
+                "an executor with staged state answered from the shared cache"
+            );
+        }
     }
 }

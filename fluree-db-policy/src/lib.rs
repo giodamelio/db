@@ -53,7 +53,7 @@ mod schema;
 mod types;
 mod wire;
 
-pub use class_lookup::{lookup_subject_classes, populate_class_cache};
+pub use class_lookup::{lookup_subject_classes, lookup_subject_refs, populate_class_cache};
 pub use error::{PolicyError, Result};
 pub use evaluate::{
     build_policy_values_clause, filter_by_required, ClassScope, PolicyContext,

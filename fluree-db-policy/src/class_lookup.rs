@@ -29,12 +29,20 @@ pub async fn lookup_subject_classes(
     subjects: &[Sid],
     db: GraphDbRef<'_>,
 ) -> Result<HashMap<Sid, Vec<Sid>>> {
+    lookup_subject_refs(subjects, &Sid::new(RDF, RDF_TYPE), db).await
+}
+
+/// Look up, for each subject, the IRIs it has as `predicate` values.
+///
+/// Literal values are left out. Subjects with none are not present in the map.
+pub async fn lookup_subject_refs(
+    subjects: &[Sid],
+    predicate: &Sid,
+    db: GraphDbRef<'_>,
+) -> Result<HashMap<Sid, Vec<Sid>>> {
     if subjects.is_empty() {
         return Ok(HashMap::new());
     }
-
-    // Create the rdf:type SID
-    let rdf_type = Sid::new(RDF, RDF_TYPE);
 
     // Prefer an index-native batched lookup when available (binary range provider).
     if let Some(provider) = db.snapshot.range_provider.as_ref() {
@@ -42,7 +50,7 @@ pub async fn lookup_subject_classes(
         match provider.lookup_subject_predicate_refs_batched(
             db.g_id,
             fluree_db_core::IndexType::Psot,
-            &rdf_type,
+            predicate,
             subjects,
             &opts,
             db.overlay,
@@ -53,7 +61,7 @@ pub async fn lookup_subject_classes(
             }
             Err(e) => {
                 return Err(PolicyError::ClassLookup {
-                    message: format!("Batched class lookup failed: {e}"),
+                    message: format!("Batched lookup of {predicate:?} failed: {e}"),
                 });
             }
         }
@@ -61,28 +69,28 @@ pub async fn lookup_subject_classes(
 
     let mut result: HashMap<Sid, Vec<Sid>> = HashMap::new();
 
-    // Fallback: Query rdf:type for each unique subject (correct but can be slow).
+    // Fallback: Query the predicate for each unique subject (correct but can be slow).
     let unique_subjects: HashSet<&Sid> = subjects.iter().collect();
     for subject in unique_subjects {
-        let range_match = RangeMatch::subject_predicate(subject.clone(), rdf_type.clone());
+        let range_match = RangeMatch::subject_predicate(subject.clone(), predicate.clone());
         let flakes = db
             .range(fluree_db_core::IndexType::Spot, RangeTest::Eq, range_match)
             .await
             .map_err(|e| PolicyError::ClassLookup {
-                message: format!("Failed to look up classes for subject: {e}"),
+                message: format!("Failed to look up {predicate:?} for subject: {e}"),
             })?;
 
-        let mut classes: Vec<Sid> = flakes
+        let mut refs: Vec<Sid> = flakes
             .into_iter()
             .filter_map(|f| match f.o {
-                FlakeValue::Ref(class_sid) => Some(class_sid),
+                FlakeValue::Ref(sid) => Some(sid),
                 _ => None,
             })
             .collect();
-        classes.sort();
-        classes.dedup();
-        if !classes.is_empty() {
-            result.insert(subject.clone(), classes);
+        refs.sort();
+        refs.dedup();
+        if !refs.is_empty() {
+            result.insert(subject.clone(), refs);
         }
     }
 
