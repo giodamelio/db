@@ -55,6 +55,7 @@ pub mod ndjson_stream;
 mod rdf_xml;
 pub(crate) mod sparql;
 mod sparql_xml;
+mod turtle;
 mod typed;
 
 /// Registry-name predicate: does this variable name belong to a
@@ -311,7 +312,11 @@ pub fn format_results(
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(
         config.format,
-        OutputFormat::Tsv | OutputFormat::Csv | OutputFormat::SparqlXml | OutputFormat::RdfXml
+        OutputFormat::Tsv
+            | OutputFormat::Csv
+            | OutputFormat::SparqlXml
+            | OutputFormat::RdfXml
+            | OutputFormat::Turtle
     ) {
         return Err(FormatError::InvalidBinding(format!(
             "{:?} format produces bytes/String, not JsonValue. \
@@ -361,6 +366,10 @@ pub fn format_results(
         )),
         OutputFormat::RdfXml => Err(FormatError::InvalidBinding(
             "RDF/XML produces String, not JsonValue. Use format_results_string() instead."
+                .to_string(),
+        )),
+        OutputFormat::Turtle => Err(FormatError::InvalidBinding(
+            "Turtle produces String, not JsonValue. Use format_results_string() instead."
                 .to_string(),
         )),
         OutputFormat::Tsv | OutputFormat::Csv => {
@@ -438,6 +447,10 @@ pub fn format_results_string(
         OutputFormat::RdfXml => {
             let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
             return rdf_xml::format(result, &compactor, config);
+        }
+        OutputFormat::Turtle => {
+            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+            return turtle::format(result, &compactor, config);
         }
         _ => {}
     }
@@ -590,6 +603,10 @@ pub async fn format_results_async(
             "RDF/XML produces String, not JsonValue. Use format_results_string_async() instead."
                 .to_string(),
         )),
+        OutputFormat::Turtle => Err(FormatError::InvalidBinding(
+            "Turtle produces String, not JsonValue. Use format_results_string_async() instead."
+                .to_string(),
+        )),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -688,6 +705,10 @@ pub async fn format_results_string_async(
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return rdf_xml::format(result, &compactor, config);
         }
+        OutputFormat::Turtle => {
+            let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
+            return turtle::format(result, &compactor, config);
+        }
         _ => {}
     }
 
@@ -734,6 +755,10 @@ pub async fn format_results_string_async_dataset(
         OutputFormat::RdfXml => {
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return rdf_xml::format(result, &compactor, config);
+        }
+        OutputFormat::Turtle => {
+            let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
+            return turtle::format(result, &compactor, config);
         }
         _ => {}
     }

@@ -1599,7 +1599,7 @@ fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
 ///
 /// Escapes: `\` `"` `\n` `\r` `\t` and control chars (U+0000..U+001F, U+007F..U+009F)
 /// via `\uXXXX`.
-fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+pub(crate) fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     for ch in s.chars() {
         match ch {
             '\\' => w.write_all(b"\\\\")?,

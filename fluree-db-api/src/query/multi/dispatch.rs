@@ -129,7 +129,7 @@ pub enum MultiQueryError {
 ///
 /// JSON-producing formats (`JsonLd`, `SparqlJson`, `TypedJson`, `AgentJson`)
 /// are accepted; anything that produces a bytes-/string-shaped payload
-/// (`Tsv`, `Csv`, `SparqlXml`, `RdfXml`) is rejected — those need a
+/// (`Tsv`, `Csv`, `SparqlXml`, `RdfXml`, `Turtle`) is rejected — those need a
 /// designed per-alias binary response story that doesn't exist in v1.
 fn is_json_output_format(format: OutputFormat) -> bool {
     matches!(

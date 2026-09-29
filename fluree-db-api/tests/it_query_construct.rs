@@ -994,6 +994,62 @@ async fn sparql_construct_shared_object_rdfxml_keeps_both_predicates() {
     );
 }
 
+/// DESCRIBE as Turtle: one subject block, the type written `a`, every property
+/// present, and a literal carrying its datatype. The JSON-LD graph output is the
+/// oracle for how many values there are.
+#[tokio::test]
+async fn sparql_describe_as_turtle_is_one_subject_block() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+    let sparql = "DESCRIBE <http://example.org/jdoe>";
+
+    let ttl = db
+        .query(&fluree)
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::turtle())
+        .execute_formatted_string()
+        .await
+        .expect("Turtle must execute");
+
+    let subject_lines = ttl
+        .lines()
+        .filter(|l| l.contains("jdoe") && !l.starts_with(' ') && !l.starts_with("@prefix"))
+        .count();
+    assert_eq!(subject_lines, 1, "one block for the one subject:\n{ttl}");
+    assert!(ttl.contains(" a "), "rdf:type is written `a`:\n{ttl}");
+    assert!(ttl.contains("\"Jane Doe\""), "the name survives:\n{ttl}");
+    for n in ["3", "7", "42", "99"] {
+        assert!(
+            ttl.contains(&format!(" {n} ,"))
+                || ttl.contains(&format!(" {n} ."))
+                || ttl.contains(&format!(" {n} ;"))
+                || ttl.contains(&format!("{n}\"^^")),
+            "favNum {n} is present:\n{ttl}"
+        );
+    }
+    assert!(ttl.trim_end().ends_with('.'), "the block is closed:\n{ttl}");
+}
+
+/// A SELECT has no graph to serialize, so Turtle refuses it rather than inventing
+/// one — the same answer RDF/XML gives.
+#[tokio::test]
+async fn sparql_select_as_turtle_is_refused() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let err = db
+        .query(&fluree)
+        .sparql("SELECT ?s WHERE { ?s ?p ?o }")
+        .format(fluree_db_api::FormatterConfig::turtle())
+        .execute_formatted_string()
+        .await
+        .expect_err("a SELECT must not serialize as Turtle");
+    assert!(
+        err.to_string().contains("CONSTRUCT/DESCRIBE"),
+        "the refusal names what would work: {err}"
+    );
+}
+
 /// A fully-constant template prunes the WHERE schema to zero columns
 /// (`compute_variable_deps` seeds an empty needed set from a template that
 /// references no variable), and a column-less `Batch` carries its row count
@@ -1089,6 +1145,7 @@ mod construct_license_output_gate {
         SparqlJson => Canonicalizes, // coerced to the same construct::format path (#1274)
         SparqlXml  => Rejects,       // sparql_xml::format: SELECT/ASK only
         RdfXml     => Canonicalizes, // rdf_xml::format → Graph::canonicalize
+        Turtle     => Canonicalizes, // turtle::format → Graph::canonicalize
         TypedJson  => Canonicalizes, // coerced to construct::format
         Tsv        => Rejects,       // delimited::reject_non_tabular
         Csv        => Rejects,       // delimited::reject_non_tabular

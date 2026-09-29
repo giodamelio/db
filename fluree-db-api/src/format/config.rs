@@ -50,6 +50,16 @@ pub enum OutputFormat {
     /// query builder `.execute_formatted_string()`.
     RdfXml,
 
+    /// Turtle graph serialization (`text/turtle`)
+    ///
+    /// **Graph results only** (SPARQL CONSTRUCT / DESCRIBE). Produces `String`, not
+    /// `JsonValue`. Prefixes come from the query's `@context`, as the JSON-LD graph
+    /// output's compaction does.
+    ///
+    /// **Note**: Use `format_results_string()` / `format_results_string_async()` or
+    /// query builder `.execute_formatted_string()`.
+    Turtle,
+
     /// Typed JSON format
     ///
     /// Always includes explicit datatype (even for inferable types):
@@ -235,6 +245,14 @@ impl FormatterConfig {
         }
     }
 
+    /// Create a Turtle config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn turtle() -> Self {
+        Self {
+            format: OutputFormat::Turtle,
+            ..Default::default()
+        }
+    }
+
     /// Create a TypedJson config
     pub fn typed_json() -> Self {
         Self {
@@ -346,6 +364,12 @@ mod tests {
     fn test_rdf_xml_config() {
         let config = FormatterConfig::rdf_xml();
         assert_eq!(config.format, OutputFormat::RdfXml);
+    }
+
+    #[test]
+    fn test_turtle_config() {
+        let config = FormatterConfig::turtle();
+        assert_eq!(config.format, OutputFormat::Turtle);
     }
 
     #[test]
